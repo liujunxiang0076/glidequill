@@ -2,6 +2,7 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 
 mod input;
+mod settings;
 mod ui;
 use glidequill::{ACTIONS, Action, Config, DIRECTIONS, Stroke};
 use std::{
@@ -35,7 +36,6 @@ thread_local! {
     static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
     static DARK:Cell<bool>=const{Cell::new(false)};
     static TRAIL:RefCell<Vec<POINT>>=const{RefCell::new(Vec::new())};
-    static CONFIG:RefCell<Config>=RefCell::new(Config::default());
     static WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static HOOK:Cell<HHOOK>=const{Cell::new(null_mut())};
     static GROUP:Cell<bool>=const{Cell::new(false)};
@@ -48,36 +48,6 @@ fn app_window() -> HWND {
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
-}
-fn path() -> io::Result<PathBuf> {
-    Ok(
-        PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or(io::ErrorKind::NotFound)?)
-            .join("GlideQuill/rules.json"),
-    )
-}
-fn load() -> io::Result<Config> {
-    match std::fs::read(path()?) {
-        Ok(b) => Ok(serde_json::from_slice(&b)?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(e),
-    }
-}
-fn save(c: &Config) -> io::Result<()> {
-    let file = path()?;
-    std::fs::create_dir_all(file.parent().unwrap())?;
-    let tmp = file.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(c)?)?;
-    if unsafe {
-        MoveFileExW(
-            wide(&tmp.to_string_lossy()).as_ptr(),
-            wide(&file.to_string_lossy()).as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 fn label(id: i32, s: &str) {
     unsafe {
@@ -112,8 +82,8 @@ unsafe fn control(class: &str, s: &str, id: i32, style: u32, area: [i32; 4]) -> 
 }
 fn populate() {
     let group = GROUP.with(Cell::get);
-    CONFIG.with(|c| {
-        let c = c.borrow();
+    {
+        let c = settings::snapshot();
         let rules = if group { c.browser } else { c.global };
         for (i, a) in rules.iter().enumerate() {
             unsafe {
@@ -130,7 +100,7 @@ fn populate() {
                 }
             }
         }
-    });
+    }
 }
 fn read_rules(c: &mut Config) {
     let group = GROUP.with(Cell::get);
@@ -231,7 +201,7 @@ unsafe extern "system" fn pad_proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 if let Some(mut s) = stroke {
                     s.sample(x, y);
                     if let Some(dir) = s.direction() {
-                        let mut c = CONFIG.with(|c| c.borrow().clone());
+                        let mut c = (*settings::snapshot()).clone();
                         read_rules(&mut c);
                         let a = c.resolve(GROUP.with(Cell::get), dir);
                         label(
@@ -308,16 +278,16 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 let id = (wp & 0xffff) as i32;
                 match id {
                     SCOPE | BROWSER => {
-                        let mut draft = CONFIG.with(|c| c.borrow().clone());
+                        let mut draft = (*settings::snapshot()).clone();
                         read_rules(&mut draft);
-                        if CONFIG.with(|c| {
-                            draft.global != c.borrow().global || draft.browser != c.borrow().browser
-                        }) && MessageBoxW(
-                            w,
-                            wide("切换范围将放弃未保存的修改，继续？").as_ptr(),
-                            wide("拂标").as_ptr(),
-                            MB_OKCANCEL,
-                        ) != IDOK
+                        let active = settings::snapshot();
+                        if (draft.global != active.global || draft.browser != active.browser)
+                            && MessageBoxW(
+                                w,
+                                wide("切换范围将放弃未保存的修改，继续？").as_ptr(),
+                                wide("拂标").as_ptr(),
+                                MB_OKCANCEL,
+                            ) != IDOK
                         {
                             return 0;
                         }
@@ -334,11 +304,10 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         );
                     }
                     SAVE => {
-                        let mut c = CONFIG.with(|c| c.borrow().clone());
+                        let mut c = (*settings::snapshot()).clone();
                         read_rules(&mut c);
-                        match save(&c) {
+                        match settings::apply(c) {
                             Ok(()) => {
-                                CONFIG.with(|v| *v.borrow_mut() = c);
                                 label(RESULT, "已保存 · 当前规则立即生效");
                             }
                             Err(e) => label(RESULT, &format!("保存失败：{e}")),
@@ -372,10 +341,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             RUN => {
                 if !HOOK.with(Cell::get).is_null() && wp as HWND == GetForegroundWindow() {
                     let dir = DIRECTIONS[(lp & 3) as usize];
-                    input::perform(
-                        wp as HWND,
-                        CONFIG.with(|c| c.borrow().resolve(lp & 256 != 0, dir)),
-                    );
+                    input::perform(wp as HWND, settings::snapshot().resolve(lp & 256 != 0, dir));
                 }
                 0
             }
@@ -461,10 +427,10 @@ fn main() {
             }
             return;
         }
-        let cfg = load();
+        let cfg = settings::load();
         let error = cfg.as_ref().err().map(ToString::to_string);
         if let Ok(c) = cfg {
-            CONFIG.with(|v| *v.borrow_mut() = c)
+            settings::initialize(c)
         }
         let inst = GetModuleHandleW(null_mut());
         let pad = wide("GlideQuill.Practice");

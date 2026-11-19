@@ -51,13 +51,13 @@ unsafe fn eligible(point: POINT) -> Option<(HWND, bool)> {
         let path = String::from_utf16_lossy(&buf[..n as usize]);
         let exe = path.rsplit('\\').next()?;
         let br = glidequill::browser(exe);
-        let skip = CONFIG.with(|c| {
-            let c = c.borrow();
+        let c = settings::snapshot();
+        let skip = {
             c.excluded.iter().any(|s| s.eq_ignore_ascii_case(exe))
                 || DIRECTIONS
                     .iter()
                     .all(|&d| matches!(c.resolve(br, d), Action::Off | Action::Inherit))
-        });
+        };
         (!skip).then_some((target, br))
     }
 }
