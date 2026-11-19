@@ -2,7 +2,9 @@ use crate::{overlay, settings};
 use glidequill::{Action, Stroke};
 use windows_sys::Win32::System::{
     SystemInformation::GetTickCount,
-    SystemServices::{APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD},
+    SystemServices::{
+        APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD, APPCOMMAND_COPY, APPCOMMAND_PASTE,
+    },
 };
 use windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK;
 
@@ -131,38 +133,102 @@ fn modifiers_pressed() -> bool {
     .any(|&key| unsafe { GetAsyncKeyState(key as i32) < 0 })
 }
 
+unsafe fn focused_control(target: HWND) -> Option<HWND> {
+    let mut gui = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        (GetGUIThreadInfo(0, &mut gui) != 0
+            && gui.hwndActive == target
+            && !gui.hwndFocus.is_null()
+            && GetAncestor(gui.hwndFocus, GA_ROOT) == target)
+            .then_some(gui.hwndFocus)
+    }
+}
+
+unsafe fn app_command(target: HWND, source: HWND, command: u32) {
+    unsafe {
+        PostMessageW(
+            target,
+            WM_APPCOMMAND,
+            source as usize,
+            ((FAPPCOMMAND_MOUSE | command) << 16) as isize,
+        );
+    }
+}
+
+// Edit controls accept direct selection commands. Other applications own the
+// clipboard formats and route the standard application command themselves.
+unsafe fn edit_command(target: HWND, focus: HWND, copy: bool) {
+    unsafe {
+        let mut name = [0u16; 128];
+        let len = GetClassNameW(focus, name.as_mut_ptr(), name.len() as i32);
+        let class = String::from_utf16_lossy(&name[..len as usize]).to_ascii_lowercase();
+        if class == "edit" || class.starts_with("richedit") {
+            PostMessageW(focus, if copy { WM_COPY } else { WM_PASTE }, 0, 0);
+        } else {
+            app_command(
+                target,
+                focus,
+                if copy {
+                    APPCOMMAND_COPY
+                } else {
+                    APPCOMMAND_PASTE
+                },
+            );
+        }
+    }
+}
+
+unsafe fn window_command(target: HWND, command: u32) {
+    unsafe {
+        let style = GetWindowLongW(target, GWL_STYLE) as u32;
+        if style & WS_SYSMENU == 0
+            || (command == SC_MINIMIZE && style & WS_MINIMIZEBOX == 0)
+            || (command == SC_MAXIMIZE && style & WS_MAXIMIZEBOX == 0)
+        {
+            return;
+        }
+        let menu = GetSystemMenu(target, 0);
+        if menu.is_null()
+            || GetMenuState(menu, command, MF_BYCOMMAND) & (MF_GRAYED | MF_DISABLED) != 0
+        {
+            return;
+        }
+        PostMessageW(target, WM_SYSCOMMAND, command as usize, 0);
+    }
+}
+
 // Address the original HWND directly. A slow application must never block the input hook.
-unsafe fn navigate(target: HWND, action: Action) {
+unsafe fn execute(target: HWND, action: Action) {
     unsafe {
         if target != GetForegroundWindow() || modifiers_pressed() {
             return;
         }
         match action {
-            Action::Back | Action::Forward => {
-                let command = if action == Action::Back {
-                    APPCOMMAND_BROWSER_BACKWARD
-                } else {
-                    APPCOMMAND_BROWSER_FORWARD
-                };
-                PostMessageW(
-                    target,
-                    WM_APPCOMMAND,
-                    target as usize,
-                    ((FAPPCOMMAND_MOUSE | command) << 16) as isize,
-                );
-            }
-            Action::Home | Action::End => {
-                let mut gui = GUITHREADINFO {
-                    cbSize: size_of::<GUITHREADINFO>() as u32,
-                    ..Default::default()
-                };
-                if GetGUIThreadInfo(0, &mut gui) == 0
-                    || gui.hwndActive != target
-                    || gui.hwndFocus.is_null()
-                    || GetAncestor(gui.hwndFocus, GA_ROOT) != target
-                {
-                    return;
+            Action::Unassigned => {}
+            Action::Back => app_command(target, target, APPCOMMAND_BROWSER_BACKWARD),
+            Action::Forward => app_command(target, target, APPCOMMAND_BROWSER_FORWARD),
+            Action::Copy | Action::Paste => {
+                if let Some(focus) = focused_control(target) {
+                    edit_command(target, focus, action == Action::Copy);
                 }
+            }
+            Action::Minimize => window_command(target, SC_MINIMIZE),
+            Action::Maximize => window_command(
+                target,
+                if IsZoomed(target) != 0 {
+                    SC_RESTORE
+                } else {
+                    SC_MAXIMIZE
+                },
+            ),
+            Action::Close => window_command(target, SC_CLOSE),
+            Action::Home | Action::End => {
+                let Some(focus) = focused_control(target) else {
+                    return;
+                };
                 let key = if action == Action::Home {
                     VK_HOME
                 } else {
@@ -170,16 +236,15 @@ unsafe fn navigate(target: HWND, action: Action) {
                 };
                 let scan = MapVirtualKeyW(key.into(), MAPVK_VK_TO_VSC);
                 let flags = 1 | ((scan & 0xff) << 16) | (1 << 24);
-                if PostMessageW(gui.hwndFocus, WM_KEYDOWN, key as usize, flags as isize) != 0 {
+                if PostMessageW(focus, WM_KEYDOWN, key as usize, flags as isize) != 0 {
                     PostMessageW(
-                        gui.hwndFocus,
+                        focus,
                         WM_KEYUP,
                         key as usize,
                         (flags | (3 << 30)) as i32 as isize,
                     );
                 }
             }
-            _ => {}
         }
     }
 }
@@ -259,7 +324,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                     } else {
                         let action = s.stroke.gesture().map(|d| s.bindings[d as usize]);
                         if let Some(action) = overlay::finish(window, point, action) {
-                            navigate(s.target, action);
+                            execute(s.target, action);
                         }
                     }
                     true
@@ -386,9 +451,9 @@ mod tests {
                 (380, 240, "前进"),
                 (280, 140, "页面顶部"),
                 (280, 340, "页面底部"),
-                (190, 150, "复制 · 仅预览"),
-                (370, 150, "粘贴 · 仅预览"),
-                (190, 330, "最小化窗口 · 仅预览"),
+                (190, 150, "复制"),
+                (370, 150, "粘贴"),
+                (190, 330, "最小化窗口"),
                 (370, 330, ""),
             ] {
                 let end = POINT { x, y };
@@ -440,11 +505,12 @@ mod tests {
                 let downs = received(hwnd, WM_KEYDOWN);
                 let ups = received(hwnd, WM_KEYUP);
                 match expected {
-                    "后退" | "前进" => {
-                        let command = if expected == "后退" {
-                            APPCOMMAND_BROWSER_BACKWARD
-                        } else {
-                            APPCOMMAND_BROWSER_FORWARD
+                    "后退" | "前进" | "复制" | "粘贴" => {
+                        let command = match expected {
+                            "后退" => APPCOMMAND_BROWSER_BACKWARD,
+                            "前进" => APPCOMMAND_BROWSER_FORWARD,
+                            "复制" => APPCOMMAND_COPY,
+                            _ => APPCOMMAND_PASTE,
                         };
                         assert_eq!(commands.len(), 1);
                         assert_eq!(
@@ -504,7 +570,7 @@ mod tests {
                         (345, 131),
                         (370, 128),
                     ],
-                    "复制 · 仅预览",
+                    "复制",
                 ),
             ] {
                 assert!(gesture(WM_RBUTTONDOWN, start));
@@ -636,6 +702,66 @@ mod tests {
             );
             std::fs::remove_file(dir.join("settings.json")).unwrap();
             std::fs::remove_dir(dir).unwrap();
+            // Consume edit messages without altering the interactive user's clipboard.
+            let edit = CreateWindowExW(
+                0,
+                wide("EDIT").as_ptr(),
+                null_mut(),
+                WS_CHILD | WS_VISIBLE,
+                10,
+                10,
+                120,
+                35,
+                hwnd,
+                null_mut(),
+                instance,
+                null_mut(),
+            );
+            assert!(!edit.is_null());
+            SetFocus(edit);
+            for (action, message) in [(Action::Copy, WM_COPY), (Action::Paste, WM_PASTE)] {
+                execute(hwnd, action);
+                assert_eq!(received(edit, message).len(), 1);
+                assert!(received(hwnd, WM_APPCOMMAND).is_empty());
+            }
+            DestroyWindow(edit);
+            let sample = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                wide("GlideQuill window action test").as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                400,
+                300,
+                null_mut(),
+                null_mut(),
+                instance,
+                null_mut(),
+            );
+            assert!(!sample.is_null());
+            SetForegroundWindow(sample);
+            for (action, command) in [
+                (Action::Maximize, SC_MAXIMIZE),
+                (Action::Maximize, SC_RESTORE),
+                (Action::Minimize, SC_MINIMIZE),
+                (Action::Close, SC_CLOSE),
+            ] {
+                if action == Action::Close {
+                    assert_ne!(IsIconic(sample), 0);
+                    ShowWindow(sample, SW_RESTORE);
+                    SetForegroundWindow(sample);
+                }
+                execute(sample, action);
+                let messages = received(sample, WM_SYSCOMMAND);
+                assert_eq!(messages.len(), 1, "{action:?}");
+                assert_eq!(messages[0].wParam, command as usize);
+                DispatchMessageW(&messages[0]);
+                if action == Action::Maximize {
+                    assert_eq!(IsZoomed(sample) != 0, command == SC_MAXIMIZE);
+                }
+            }
+            assert_eq!(IsWindow(sample), 0);
             overlay::destroy();
             DestroyWindow(hwnd);
         }

@@ -1243,9 +1243,9 @@ pub unsafe fn paint(w: HWND) {
         );
         let description = match page {
             Page::Rules if SPECIAL_GROUP.with(Cell::get) => {
-                "按住右键连续回划或转向，松开执行已绑定的导航动作。"
+                "按住右键连续回划或转向，松开执行已绑定的动作。"
             }
-            Page::Rules => "松开右键执行导航动作。修改绑定后点击「保存并重载」。",
+            Page::Rules => "松开右键执行绑定动作。修改绑定后点击「保存并重载」。",
             Page::General => "管理手势的运行状态、生效范围与窗口外观。",
             Page::Exclusions => "按程序文件名匹配，同名程序共用一条排除规则。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
