@@ -1,6 +1,12 @@
 use super::*;
 use windows_sys::Win32::Graphics::GdiPlus::*;
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
+use windows_sys::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent,
+};
 
 // Layout is in device-independent pixels. Convert once at each drawing/Win32 boundary.
 pub const WIDTH: i32 = 720;
@@ -252,6 +258,8 @@ fn control_bounds(id: i32) -> [i32; 4] {
         id if id == Page::Feedback as i32 => [10, 102, RAIL - 20, 38],
         TOGGLE if PAGE.with(Cell::get) == Page::General => [RIGHT - 125, CARD_TOP + 17, 113, 34],
         TOGGLE => [RIGHT - 113, 20, 113, 34],
+        RESET_RULES => [RIGHT - 277, 21, 63, 32],
+        SAVE_RULES => [RIGHT - 208, 21, 86, 32],
         AUTOSTART => [RIGHT - 125, CARD_TOP + SETTING_HEIGHT + 17, 113, 34],
         THEME => [RIGHT - 145, CARD_TOP + 2 * SETTING_HEIGHT + 17, 132, 34],
         IDLE => [RIGHT - 145, CARD_TOP + 17, 132, 34],
@@ -271,11 +279,20 @@ fn control_bounds(id: i32) -> [i32; 4] {
     }
 }
 fn controls() -> impl Iterator<Item = i32> {
-    [THEME, TOGGLE, AUTOSTART, IDLE, LINGER, RESULT]
-        .into_iter()
-        .chain(Page::ALL.map(|p| p as i32))
-        .chain(RULE_ROW..RULE_ROW + COUNT)
-        .chain(PICKER..PICKER + COUNT)
+    [
+        THEME,
+        TOGGLE,
+        AUTOSTART,
+        IDLE,
+        LINGER,
+        RESULT,
+        RESET_RULES,
+        SAVE_RULES,
+    ]
+    .into_iter()
+    .chain(Page::ALL.map(|p| p as i32))
+    .chain(RULE_ROW..RULE_ROW + COUNT)
+    .chain(PICKER..PICKER + COUNT)
 }
 pub unsafe fn layout() {
     unsafe {
@@ -285,6 +302,7 @@ pub unsafe fn layout() {
                 THEME | AUTOSTART => page == Page::General,
                 IDLE | LINGER => page == Page::Feedback,
                 TOGGLE => page != Page::Feedback,
+                RESET_RULES | SAVE_RULES => page == Page::Rules,
                 id if (RULE_ROW..RULE_ROW + COUNT).contains(&id)
                     || (PICKER..PICKER + COUNT).contains(&id) =>
                 {
@@ -330,6 +348,8 @@ pub unsafe fn build() {
             (Page::Rules as i32, Page::Rules.title()),
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
+            (RESET_RULES, "重置"),
+            (SAVE_RULES, "保存并重载"),
             (AUTOSTART, "启用登录自启"),
             (IDLE, "停笔取消时间"),
             (LINGER, "松键后保留时间"),
@@ -388,7 +408,34 @@ unsafe fn caption(w: HWND) -> String {
     let n = unsafe { GetWindowTextW(w, buf.as_mut_ptr(), buf.len() as i32) };
     String::from_utf16_lossy(&buf[..n as usize])
 }
-// Keep native keyboard, accessibility and dropdown handling.
+thread_local! {
+    static HOVER_FIELD: Cell<HWND> = const { Cell::new(null_mut()) };
+    static PRESSED_CLEAR: Cell<HWND> = const { Cell::new(null_mut()) };
+}
+unsafe fn clear_target(w: HWND) -> Option<RECT> {
+    unsafe {
+        if HOVER_FIELD.with(Cell::get) != w
+            || IsWindowEnabled(w) == 0
+            || SendMessageW(w, CB_GETCURSEL, 0, 0) <= Action::Unassigned as isize
+            || SendMessageW(w, CB_GETDROPPEDSTATE, 0, 0) != 0
+        {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetClientRect(w, &mut r);
+        r.left = r.right - px(46);
+        r.right -= px(23);
+        Some(r)
+    }
+}
+unsafe fn hits_clear(w: HWND, lp: LPARAM) -> bool {
+    let pt = POINT {
+        x: lp as i16 as i32,
+        y: (lp >> 16) as i16 as i32,
+    };
+    unsafe { clear_target(w).is_some_and(|r| PtInRect(&r, pt) != 0) }
+}
+// Only the clear target intercepts clicks. The rest of the field stays a native combo.
 unsafe extern "system" fn action_field(
     w: HWND,
     m: u32,
@@ -398,6 +445,52 @@ unsafe extern "system" fn action_field(
     _data: usize,
 ) -> LRESULT {
     unsafe {
+        match m {
+            WM_MOUSEMOVE if HOVER_FIELD.with(Cell::get) != w => {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: w,
+                    ..Default::default()
+                };
+                if TrackMouseEvent(&mut track) != 0 {
+                    let previous = HOVER_FIELD.with(|v| v.replace(w));
+                    if !previous.is_null() {
+                        InvalidateRect(previous, null_mut(), 0);
+                    }
+                    InvalidateRect(w, null_mut(), 0);
+                }
+            }
+            WM_MOUSELEAVE if HOVER_FIELD.with(Cell::get) == w => {
+                HOVER_FIELD.with(|v| v.set(null_mut()));
+                InvalidateRect(w, null_mut(), 0);
+            }
+            WM_LBUTTONDOWN if hits_clear(w, lp) => {
+                SetFocus(w);
+                SetCapture(w);
+                PRESSED_CLEAR.with(|v| v.set(w));
+                InvalidateRect(w, null_mut(), 0);
+                return 0;
+            }
+            WM_LBUTTONUP if PRESSED_CLEAR.with(Cell::get) == w => {
+                let clear = hits_clear(w, lp);
+                PRESSED_CLEAR.with(|v| v.set(null_mut()));
+                if GetCapture() == w {
+                    ReleaseCapture();
+                }
+                if clear {
+                    SendMessageW(w, CB_SETCURSEL, Action::Unassigned as usize, 0);
+                    update_rule_buttons();
+                }
+                InvalidateRect(w, null_mut(), 0);
+                return 0;
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE if PRESSED_CLEAR.with(Cell::get) == w => {
+                PRESSED_CLEAR.with(|v| v.set(null_mut()));
+                InvalidateRect(w, null_mut(), 0);
+            }
+            _ => {}
+        }
         if matches!(m, WM_PAINT | WM_PRINTCLIENT | WM_PRINT) {
             let mut ps = PAINTSTRUCT::default();
             let dc = if m == WM_PAINT {
@@ -408,16 +501,24 @@ unsafe extern "system" fn action_field(
             let mut r = RECT::default();
             GetClientRect(w, &mut r);
             let p = colors();
-            let focus = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == w;
+            let focus = GetFocus() == w;
             fill(dc, r, p.surface);
             panel(dc, r, p.surface, if focus { p.accent } else { p.edge }, 5);
             let chevron = RECT {
-                left: r.right - px(30),
+                left: r.right - px(23),
                 ..r
             };
             text(dc, "\u{e70d}", chevron, 11, Face::Icon, p.muted, DT_CENTER);
-            r.left += px(12);
-            r.right -= px(32);
+            r.left += px(9);
+            r.right = if let Some(clear) = clear_target(w) {
+                if PRESSED_CLEAR.with(Cell::get) == w {
+                    rounded(dc, inset(clear, px(3)), p.selected, 4);
+                }
+                text(dc, "\u{e711}", clear, 10, Face::Icon, p.muted, DT_CENTER);
+                clear.left
+            } else {
+                chevron.left
+            };
             text(dc, &caption(w), r, 14, Face::Body, p.text, 0);
             if m == WM_PAINT {
                 EndPaint(w, &ps);
@@ -450,7 +551,10 @@ pub unsafe fn paint(w: HWND) {
             0,
         );
         let description = match page {
-            Page::Rules => "选择动作后即时保存，划动时可在屏幕下方预览。",
+            Page::Rules if IsWindowEnabled(GetDlgItem(w, SAVE_RULES)) != 0 => {
+                "有未保存的修改，点击「保存并重载」后生效。"
+            }
+            Page::Rules => "选择手势动作，保存后可在屏幕下方预览。",
             Page::General => "管理手势启停、登录启动与窗口外观。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
         };
@@ -597,6 +701,45 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         } else if id == RESULT {
             fill(dc, r, p.base);
             text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);
+        } else if matches!(id, RESET_RULES | SAVE_RULES) {
+            let enabled = item.itemState & ODS_DISABLED == 0;
+            let primary = enabled && id == SAVE_RULES;
+            let pressed = item.itemState & ODS_SELECTED != 0;
+            fill(dc, r, p.base);
+            let background = if pressed {
+                p.selected
+            } else if primary {
+                p.accent
+            } else if enabled {
+                p.surface
+            } else {
+                p.base
+            };
+            panel(
+                dc,
+                r,
+                background,
+                if primary { p.accent } else { p.edge },
+                6,
+            );
+            let ink = if pressed {
+                p.accent
+            } else if primary {
+                p.surface
+            } else if enabled {
+                p.text
+            } else {
+                p.muted
+            };
+            text(
+                dc,
+                &caption(item.hwndItem),
+                r,
+                13,
+                Face::Body,
+                ink,
+                DT_CENTER,
+            );
         } else if id == TOGGLE || id == AUTOSTART {
             let settings = PAGE.with(Cell::get) == Page::General;
             fill(dc, r, if settings { p.surface } else { p.base });

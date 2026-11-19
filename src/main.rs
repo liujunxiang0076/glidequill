@@ -8,7 +8,7 @@ mod overlay;
 mod settings;
 mod startup;
 mod ui;
-use glidequill::{ACTIONS, DIRECTIONS};
+use glidequill::{ACTIONS, Action, DEFAULT_BINDINGS, DIRECTIONS};
 use std::{
     cell::{Cell, RefCell},
     mem::size_of,
@@ -26,6 +26,8 @@ const RESULT: i32 = 122;
 const OPEN: i32 = 123;
 const EXIT: i32 = 124;
 const THEME: i32 = 127;
+const RESET_RULES: i32 = 136;
+const SAVE_RULES: i32 = 137;
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 enum Page {
@@ -174,6 +176,47 @@ fn set_enabled(enabled: bool, persist: bool) {
 fn toggle() {
     set_enabled(LISTENER.with(|v| v.borrow().is_none()), true);
 }
+// The native selections are the draft. The listener reads only committed preferences.
+fn selected_bindings() -> Option<[Action; DIRECTIONS.len()]> {
+    let mut bindings = DEFAULT_BINDINGS;
+    for (index, binding) in bindings.iter_mut().enumerate() {
+        let selected = unsafe {
+            let field = GetDlgItem(app_window(), ui::PICKER + index as i32);
+            SendMessageW(field, CB_GETCURSEL, 0, 0)
+        };
+        *binding = *ACTIONS.get(selected as usize)?;
+    }
+    Some(bindings)
+}
+fn update_rule_buttons() {
+    let draft = selected_bindings().filter(|_| CONFIG_READABLE.with(Cell::get));
+    let saved = settings::preferences().bindings;
+    unsafe {
+        for (id, enabled) in [
+            (SAVE_RULES, draft.is_some_and(|b| b != saved)),
+            (RESET_RULES, draft.is_some_and(|b| b != DEFAULT_BINDINGS)),
+        ] {
+            let button = GetDlgItem(app_window(), id);
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, enabled.into());
+            InvalidateRect(button, null_mut(), 0);
+        }
+        InvalidateRect(app_window(), null_mut(), 0);
+    }
+}
+fn save_bindings() {
+    let Some(bindings) = selected_bindings() else {
+        return;
+    };
+    let prefs = settings::preferences();
+    if bindings == prefs.bindings {
+        return;
+    }
+    match settings::save(settings::Preferences { bindings, ..prefs }) {
+        Ok(()) => label(RESULT, "规则已保存并重载，将用于下一笔手势"),
+        Err(e) => label(RESULT, &format!("保存失败，修改已保留：{e}")),
+    }
+    update_rule_buttons();
+}
 fn apply_theme(w: HWND, dark: bool) {
     DARK.with(|v| v.set(dark));
     unsafe {
@@ -264,6 +307,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 WINDOW.with(|v| v.set(w));
                 ui::set_dpi(GetDpiForWindow(w));
                 ui::build();
+                update_rule_buttons();
                 ui::layout();
                 if overlay::create().is_err() {
                     return -1;
@@ -334,35 +378,18 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 }
                 match id {
                     id if (ui::PICKER..ui::PICKER + DIRECTIONS.len() as i32).contains(&id)
-                        && wp >> 16 == CBN_SELCHANGE as usize =>
+                        && matches!((wp >> 16) as u32, CBN_SELCHANGE | CBN_CLOSEUP) =>
                     {
-                        let field = GetDlgItem(w, id);
-                        let index = (id - ui::PICKER) as usize;
-                        let mut prefs = settings::preferences();
-                        let previous = prefs.bindings[index];
-                        let selected = SendMessageW(field, CB_GETCURSEL, 0, 0);
-                        if CONFIG_READABLE.with(Cell::get)
-                            && let Some(&action) = ACTIONS.get(selected as usize)
-                        {
-                            prefs.bindings[index] = action;
-                            match settings::save(prefs) {
-                                Ok(()) => label(
-                                    RESULT,
-                                    &format!(
-                                        "已保存 · {}划 → {}",
-                                        DIRECTIONS[index].name(),
-                                        action.label()
-                                    ),
-                                ),
-                                Err(e) => {
-                                    SendMessageW(field, CB_SETCURSEL, previous as usize, 0);
-                                    label(RESULT, &format!("绑定保存失败：{e}"));
-                                }
-                            }
-                        } else {
-                            SendMessageW(field, CB_SETCURSEL, previous as usize, 0);
+                        update_rule_buttons();
+                        InvalidateRect(GetDlgItem(w, id), null_mut(), 0);
+                    }
+                    SAVE_RULES if CONFIG_READABLE.with(Cell::get) => save_bindings(),
+                    RESET_RULES if CONFIG_READABLE.with(Cell::get) => {
+                        for (index, action) in DEFAULT_BINDINGS.iter().enumerate() {
+                            let field = GetDlgItem(w, ui::PICKER + index as i32);
+                            SendMessageW(field, CB_SETCURSEL, *action as usize, 0);
                         }
-                        InvalidateRect(field, null_mut(), 0);
+                        update_rule_buttons();
                     }
                     AUTOSTART => {
                         match refresh_startup()

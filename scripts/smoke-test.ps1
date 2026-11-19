@@ -15,6 +15,12 @@ public static class GestureSmoke {
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out Bounds r);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out Bounds r);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h,ref Point pt);
+    [DllImport("user32.dll")] public static extern bool GetPhysicalCursorPos(out Point pt);
+    [DllImport("user32.dll")] public static extern bool SetPhysicalCursorPos(int x,int y);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point pt);
+    public struct Point {public int X,Y;}
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,uint attr,out Bounds r,int size);
     public struct Bounds {public int Left,Top,Right,Bottom;}
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
@@ -103,14 +109,72 @@ try {
         Require ([GestureSmoke]::GetDlgItem($w,$id) -eq [IntPtr]::Zero) 'Obsolete editor control'
     }
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
-    Save-Screenshot $w 'windows-light.png'
+    $apply=[GestureSmoke]::GetDlgItem($w,137)
+    $reset=[GestureSmoke]::GetDlgItem($w,136)
+    Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Clean draft enabled Save'
+    $before=[IO.File]::ReadAllText($prefsFile)
     $diagonal=[GestureSmoke]::GetDlgItem($w,165)
     [void](Send $diagonal 0x14f 1)
     Require ((Send $diagonal 0x157).ToInt32() -ne 0) 'Dropdown did not open'
     foreach ($step in 1..5) { [void](Send $diagonal 0x100 0x28) }
     [void](Send $diagonal 0x100 0x0d)
+    Require ([GestureSmoke]::IsWindowEnabled($apply)) 'Editing did not enable Save'
+    Require ([GestureSmoke]::IsWindowEnabled($reset)) 'Edited defaults cannot be reset'
+    Require ([IO.File]::ReadAllText($prefsFile) -ceq $before) 'Selection wrote preferences before Save'
+    [void](Send $w 0x111 130)
+    Require (![GestureSmoke]::IsWindowVisible($apply)) 'Rules button shown in General'
+    [void](Send $w 0x111 134)
+    Require ((Send $diagonal 0x147).ToInt32() -eq 5) 'Page switch lost draft'
+    # Simulate a write failure, then retry without re-entering the draft.
+    $lock=[IO.File]::Open($prefsFile,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try { [void](Send $apply 0xf5) } finally { $lock.Dispose() }
+    Require ((Get-Label $w 122) -like '保存失败*' -and [GestureSmoke]::IsWindowEnabled($apply)) 'Failed write discarded draft'
+    Require ([IO.File]::ReadAllText($prefsFile) -ceq $before) 'Failed write changed preferences'
+    [void](Send $apply 0xf5)
+    Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Save left the draft dirty'
     $saved=Get-Content $prefsFile -Raw | ConvertFrom-Json
     Require ($saved.bindings[5] -eq 'copy' -and $saved.idle_ms -eq 1000) 'Keyboard selection or preference preservation failed'
+    # Press the hover clear target; the chevron and keyboard still open the native list.
+    $dpi=[GestureSmoke]::GetDpiForWindow($diagonal)
+    $rect=[GestureSmoke+Bounds]::new()
+    $target=[GestureSmoke+Point]::new()
+    $original=[GestureSmoke+Point]::new()
+    $prior=[GestureSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try {
+        Require ([GestureSmoke]::GetClientRect($diagonal,[ref]$rect)) 'No picker bounds'
+        $target.X=$rect.Right-[int](34*$dpi/96)
+        $target.Y=[int]($rect.Bottom/2)
+        $point=($target.Y -shl 16) -bor $target.X
+        Require ([GestureSmoke]::ClientToScreen($diagonal,[ref]$target)) 'No screen position'
+        Require ([GestureSmoke]::GetPhysicalCursorPos([ref]$original)) 'Missing initial cursor'
+        try {
+            Require ([GestureSmoke]::SetPhysicalCursorPos($target.X,$target.Y)) 'Cannot hover picker'
+            Start-Sleep -Milliseconds 120
+            Require ([GestureSmoke]::WindowFromPoint($target) -eq $diagonal) 'Picker is covered during hover test'
+            [void](Send $diagonal 0x200 0 $point)
+            Save-Screenshot $w 'windows-light.png'
+            [void](Send $diagonal 0x201 1 $point)
+            [void](Send $diagonal 0x202 0 0)
+            Require ((Send $diagonal 0x147).ToInt32() -eq 5) 'Releasing outside the clear target cleared a binding'
+            [void](Send $diagonal 0x201 1 $point)
+            [void](Send $diagonal 0x202 0 $point)
+        } finally { [void][GestureSmoke]::SetPhysicalCursorPos($original.X,$original.Y) }
+    } finally {
+        [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior)
+    }
+    $choice=(Send $diagonal 0x147).ToInt32()
+    $dropped=(Send $diagonal 0x157).ToInt32()
+    Require ($choice -eq 0 -and $dropped -eq 0) "Hover clear failed (selection $choice, dropdown $dropped, DPI $dpi, bounds $($rect.Right)x$($rect.Bottom), click $point)"
+    Require ((Get-Content $prefsFile -Raw | ConvertFrom-Json).bindings[5] -eq 'copy') 'Hover clear applied without Save'
+    [void](Send $apply 0xf5)
+    Require ((Get-Content $prefsFile -Raw | ConvertFrom-Json).bindings[5] -eq 'unassigned') 'Cleared binding not committed'
+    # Save a custom binding again, then keep a factory-reset draft open across unrelated edits.
+    [void](Send $diagonal 0x14e 5)
+    [void](Send $w 0x111 (0x10000+165) $diagonal)
+    [void](Send $apply 0xf5)
+    [void](Send $reset 0xf5)
+    Require ((Send $diagonal 0x147).ToInt32() -eq 0 -and [GestureSmoke]::IsWindowEnabled($apply)) 'Reset did not stage defaults'
+    Require ((Get-Content $prefsFile -Raw | ConvertFrom-Json).bindings[5] -eq 'copy') 'Reset applied without Save'
     [void](Send $w 0x111 130)
     Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,131))) 'Missing general settings'
     Require (![GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'Timing control visible in General'
@@ -176,7 +240,7 @@ try {
     Require ((Get-Label $p.MainWindowHandle 121) -eq '启用全局手势') 'Paused state not restored'
     [void](Send $p.MainWindowHandle 0x111 124)
     Require ($p.WaitForExit(5000)) 'Final exit failed'
-    Write-Output 'PASS: persisted settings and pause, isolated logon registration and tray startup, eight direction dropdowns and binding persistence, preview switch, theme, tray, single-instance and legacy config preservation.'
+    Write-Output 'PASS: eight native pickers, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray and legacy configuration.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     if (Test-Path -LiteralPath $testKey) {Remove-Item -LiteralPath $testKey}
