@@ -18,7 +18,7 @@ const CARD_TOP: i32 = 94;
 const SETTING_HEIGHT: i32 = 68;
 const COLUMN: i32 = (RIGHT - LEFT - 2) / 2;
 pub const PICKER: i32 = 160;
-const COUNT: i32 = DIRECTIONS.len() as i32;
+const COUNT: i32 = GESTURES.len() as i32;
 const ROW_START: i32 = CARD_TOP + 34;
 const ROW_HEIGHT: i32 = 46;
 pub const RULE_ROW: i32 = 140;
@@ -258,6 +258,8 @@ fn control_bounds(id: i32) -> [i32; 4] {
         id if id == Page::Feedback as i32 => [10, 102, RAIL - 20, 38],
         TOGGLE if PAGE.with(Cell::get) == Page::General => [RIGHT - 125, CARD_TOP + 17, 113, 34],
         TOGGLE => [RIGHT - 113, 20, 113, 34],
+        BASIC_TAB => [LEFT + 6, CARD_TOP + 3, 76, 28],
+        SPECIAL_TAB => [LEFT + 85, CARD_TOP + 3, 76, 28],
         RESET_RULES => [RIGHT - 277, 21, 63, 32],
         SAVE_RULES => [RIGHT - 208, 21, 86, 32],
         AUTOSTART => [RIGHT - 125, CARD_TOP + SETTING_HEIGHT + 17, 113, 34],
@@ -267,7 +269,7 @@ fn control_bounds(id: i32) -> [i32; 4] {
         RESULT => [LEFT, HEIGHT - 35, RIGHT - LEFT, 26],
         _ => {
             let picker = id >= PICKER;
-            let index = id - if picker { PICKER } else { RULE_ROW };
+            let index = (id - if picker { PICKER } else { RULE_ROW }) % BASIC_COUNT as i32;
             let x = LEFT + 1 + index / 4 * COLUMN;
             let y = ROW_START + index % 4 * ROW_HEIGHT;
             if picker {
@@ -286,6 +288,8 @@ fn controls() -> impl Iterator<Item = i32> {
         IDLE,
         LINGER,
         RESULT,
+        BASIC_TAB,
+        SPECIAL_TAB,
         RESET_RULES,
         SAVE_RULES,
     ]
@@ -302,11 +306,12 @@ pub unsafe fn layout() {
                 THEME | AUTOSTART => page == Page::General,
                 IDLE | LINGER => page == Page::Feedback,
                 TOGGLE => page != Page::Feedback,
-                RESET_RULES | SAVE_RULES => page == Page::Rules,
-                id if (RULE_ROW..RULE_ROW + COUNT).contains(&id)
-                    || (PICKER..PICKER + COUNT).contains(&id) =>
-                {
-                    page == Page::Rules
+                RESET_RULES | SAVE_RULES | BASIC_TAB | SPECIAL_TAB => page == Page::Rules,
+                id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
+                    page == Page::Rules && rule_range().contains(&((id - RULE_ROW) as usize))
+                }
+                id if (PICKER..PICKER + COUNT).contains(&id) => {
+                    page == Page::Rules && rule_range().contains(&((id - PICKER) as usize))
                 }
                 _ => true,
             };
@@ -348,6 +353,8 @@ pub unsafe fn build() {
             (Page::Rules as i32, Page::Rules.title()),
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
+            (BASIC_TAB, "基础方向"),
+            (SPECIAL_TAB, "特殊手势"),
             (RESET_RULES, "重置"),
             (SAVE_RULES, "保存并重载"),
             (AUTOSTART, "启用登录自启"),
@@ -370,7 +377,7 @@ pub unsafe fn build() {
             static_style,
             control_bounds(RESULT),
         );
-        for (index, dir) in DIRECTIONS.iter().enumerate() {
+        for (index, dir) in GESTURES.iter().enumerate() {
             let id = RULE_ROW + index as i32;
             control("STATIC", dir.name(), id, static_style, control_bounds(id));
             let id = PICKER + index as i32;
@@ -551,10 +558,7 @@ pub unsafe fn paint(w: HWND) {
             0,
         );
         let description = match page {
-            Page::Rules if IsWindowEnabled(GetDlgItem(w, SAVE_RULES)) != 0 => {
-                "有未保存的修改，点击「保存并重载」后生效。"
-            }
-            Page::Rules => "选择手势动作，保存后可在屏幕下方预览。",
+            Page::Rules => "选择动作后，点击「保存并重载」应用修改。",
             Page::General => "管理手势启停、登录启动与窗口外观。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
         };
@@ -574,15 +578,6 @@ pub unsafe fn paint(w: HWND) {
                 p.surface,
                 p.edge,
                 8,
-            );
-            text(
-                dc,
-                "基础方向",
-                bounds(LEFT + 15, CARD_TOP, RIGHT - 135, ROW_START),
-                14,
-                Face::Strong,
-                p.text,
-                0,
             );
             text(
                 dc,
@@ -667,11 +662,23 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         let dc = item.hDC;
         let r = item.rcItem;
         if (RULE_ROW..RULE_ROW + COUNT).contains(&id) {
-            let dir = DIRECTIONS[(id - RULE_ROW) as usize];
+            let dir = GESTURES[(id - RULE_ROW) as usize];
             fill(dc, r, p.surface);
             let tile = bounds(9, 8, 36, 35);
             rounded(dc, tile, p.selected, 7);
-            text(dc, dir.arrow(), tile, 17, Face::Arrow, p.accent, DT_CENTER);
+            text(
+                dc,
+                dir.arrow(),
+                tile,
+                if id - RULE_ROW < BASIC_COUNT as i32 {
+                    17
+                } else {
+                    12
+                },
+                Face::Arrow,
+                p.accent,
+                DT_CENTER,
+            );
             text(
                 dc,
                 dir.name(),
@@ -698,11 +705,26 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                     0,
                 );
             }
+        } else if id == BASIC_TAB || id == SPECIAL_TAB {
+            let active = (id == SPECIAL_TAB) == SPECIAL_GROUP.with(Cell::get);
+            fill(dc, r, p.surface);
+            if active {
+                rounded(dc, r, p.selected, 5);
+            }
+            text(
+                dc,
+                &caption(item.hwndItem),
+                r,
+                13,
+                if active { Face::Strong } else { Face::Body },
+                if active { p.accent } else { p.muted },
+                DT_CENTER,
+            );
         } else if id == RESULT {
             fill(dc, r, p.base);
             text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);
         } else if matches!(id, RESET_RULES | SAVE_RULES) {
-            let enabled = item.itemState & ODS_DISABLED == 0;
+            let enabled = IsWindowEnabled(item.hwndItem) != 0;
             let primary = enabled && id == SAVE_RULES;
             let pressed = item.itemState & ODS_SELECTED != 0;
             fill(dc, r, p.base);
@@ -712,6 +734,8 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 p.accent
             } else if enabled {
                 p.surface
+            } else if id == SAVE_RULES {
+                p.edge
             } else {
                 p.base
             };

@@ -20,6 +20,10 @@ public static class GestureSmoke {
     [DllImport("user32.dll")] public static extern bool GetPhysicalCursorPos(out Point pt);
     [DllImport("user32.dll")] public static extern bool SetPhysicalCursorPos(int x,int y);
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point pt);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h,uint flags);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr m,ref MonitorInfo info);
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern uint ExtractIconEx(string file,int index,IntPtr big,IntPtr small,uint count);
+    public struct MonitorInfo {public int Size; public Bounds Monitor,Work; public int Flags;}
     public struct Point {public int X,Y;}
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,uint attr,out Bounds r,int size);
     public struct Bounds {public int Left,Top,Right,Bottom;}
@@ -91,14 +95,27 @@ $legacyFile = Join-Path $legacyDir 'rules.json'
 $legacy = '{"global":["Close","Minimize","Paste","Copy"],"browser":["Home","End","Off","Off"],"excluded":["blocked.exe"]}'
 [IO.File]::WriteAllText($legacyFile,$legacy)
 $prefsFile=Join-Path $legacyDir 'settings.json'
-[IO.File]::WriteAllText($prefsFile,'{"enabled":false,"dark":false,"idle_ms":1000,"result_ms":550}')
+[IO.File]::WriteAllText($prefsFile,'{"enabled":false,"dark":false,"idle_ms":1000,"result_ms":550,"bindings":["back","forward","home","end","paste","unassigned","unassigned","unassigned"]}')
 $p = Start-TestApp
 try {
     $w=$p.MainWindowHandle
     Require ((Get-Label $w 121) -eq '启用全局手势') 'Unexpected startup hook state'
     Require ([GestureSmoke]::AreDpiAwarenessContextsEqual([GestureSmoke]::GetWindowDpiAwarenessContext($w), [IntPtr](-4))) 'Window must render at per-monitor DPI v2'
+    Require ($p.MainWindowTitle -eq 'GlideQuill · 设置') 'Missing product name'
+    Require ((Send $w 0x7f 0) -ne 0 -and (Send $w 0x7f 1) -ne 0) 'Missing window icons'
+    Require ([GestureSmoke]::ExtractIconEx($exe,-1,[IntPtr]::Zero,[IntPtr]::Zero,0) -gt 0) 'Missing executable icon'
+    $info=[GestureSmoke+MonitorInfo]::new()
+    $info.Size=40
+    $frame=[GestureSmoke+Bounds]::new()
+    $prior=[GestureSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try {
+        Require ([GestureSmoke]::GetMonitorInfo([GestureSmoke]::MonitorFromWindow($w,2),[ref]$info)) 'No monitor'
+        Require ([GestureSmoke]::GetWindowRect($w,[ref]$frame)) 'No window bounds'
+        Require ([Math]::Abs($frame.Left+$frame.Right-$info.Work.Left-$info.Work.Right) -le 1) 'Window not centered horizontally'
+        Require ([Math]::Abs($frame.Top+$frame.Bottom-$info.Work.Top-$info.Work.Bottom) -le 1) 'Window not centered vertically'
+    } finally { [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior) }
     $names = @('向左','向右','向上','向下','左上','右上','左下','右下')
-    $defaults = @(1,2,3,4,0,0,0,0)
+    $defaults = @(1,2,3,4,6,0,0,0)
     foreach ($i in 0..7) {
         Require ((Get-Label $w (140+$i)) -eq $names[$i]) 'Wrong direction'
         $field=[GestureSmoke]::GetDlgItem($w,(160+$i))
@@ -125,6 +142,14 @@ try {
     Require (![GestureSmoke]::IsWindowVisible($apply)) 'Rules button shown in General'
     [void](Send $w 0x111 134)
     Require ((Send $diagonal 0x147).ToInt32() -eq 5) 'Page switch lost draft'
+    [void](Send ([GestureSmoke]::GetDlgItem($w,139)) 0xf5)
+    $turn=[GestureSmoke]::GetDlgItem($w,173)
+    Require ([GestureSmoke]::IsWindowVisible($turn) -and ![GestureSmoke]::IsWindowVisible($diagonal)) 'Wrong gesture group'
+    Require (![GestureSmoke]::IsWindowEnabled($reset)) 'Other group affected special reset'
+    [void](Send $turn 0x14e 6)
+    [void](Send $w 0x111 (0x10000+173) $turn)
+    Save-Screenshot $w 'windows-special.png'
+    [void](Send ([GestureSmoke]::GetDlgItem($w,138)) 0xf5)
     # Simulate a write failure, then retry without re-entering the draft.
     $lock=[IO.File]::Open($prefsFile,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try { [void](Send $apply 0xf5) } finally { $lock.Dispose() }
@@ -133,7 +158,7 @@ try {
     [void](Send $apply 0xf5)
     Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Save left the draft dirty'
     $saved=Get-Content $prefsFile -Raw | ConvertFrom-Json
-    Require ($saved.bindings[5] -eq 'copy' -and $saved.idle_ms -eq 1000) 'Keyboard selection or preference preservation failed'
+    Require ($saved.bindings[5] -eq 'copy' -and $saved.bindings[4] -eq 'paste' -and $saved.bindings[13] -eq 'paste' -and $saved.idle_ms -eq 1000) 'Keyboard selection or preference preservation failed'
     # Press the hover clear target; the chevron and keyboard still open the native list.
     $dpi=[GestureSmoke]::GetDpiForWindow($diagonal)
     $rect=[GestureSmoke+Bounds]::new()
@@ -217,7 +242,7 @@ try {
     $p=[Diagnostics.Process]::Start($start)
     $deadline=[Diagnostics.Stopwatch]::StartNew()
     do {
-        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","设置")
+        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","GlideQuill · 设置")
         if ($w -ne 0 -and (Get-Label $w 121) -eq '暂停全局手势') {break}
         Start-Sleep -Milliseconds 40
     } while (!$p.HasExited -and $deadline.ElapsedMilliseconds -lt 5000)
@@ -226,6 +251,7 @@ try {
     [void](Send $w 0x111 123)
     [void](Send $w 0x111 130)
     Require ((Send ([GestureSmoke]::GetDlgItem($w,165)) 0x147).ToInt32() -eq 5) 'Diagonal binding not restored'
+    Require ((Send ([GestureSmoke]::GetDlgItem($w,173)) 0x147).ToInt32() -eq 6) 'Saved special binding not restored'
     Require ((Get-Label $w 127) -eq '浅色') 'Theme was not restored'
     Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting was not restored'
     Require ((Get-Label $w 133) -like '*0.25 秒') 'Result setting was not restored'
@@ -240,7 +266,7 @@ try {
     Require ((Get-Label $p.MainWindowHandle 121) -eq '启用全局手势') 'Paused state not restored'
     [void](Send $p.MainWindowHandle 0x111 124)
     Require ($p.WaitForExit(5000)) 'Final exit failed'
-    Write-Output 'PASS: eight native pickers, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray and legacy configuration.'
+    Write-Output 'PASS: centered branded window, embedded icon, basic and two-leg bindings, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray and legacy configuration.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     if (Test-Path -LiteralPath $testKey) {Remove-Item -LiteralPath $testKey}

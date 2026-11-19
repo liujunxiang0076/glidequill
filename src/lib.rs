@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
-pub enum Direction {
+pub enum Gesture {
     Left,
     Right,
     Up,
@@ -11,19 +11,36 @@ pub enum Direction {
     UpRight,
     DownLeft,
     DownRight,
+    UpDown,
+    DownUp,
+    LeftRight,
+    RightLeft,
+    UpThenLeft,
+    UpThenRight,
+    DownThenLeft,
+    DownThenRight,
 }
-pub const DIRECTIONS: [Direction; 8] = [
-    Direction::Left,
-    Direction::Right,
-    Direction::Up,
-    Direction::Down,
-    Direction::UpLeft,
-    Direction::UpRight,
-    Direction::DownLeft,
-    Direction::DownRight,
+pub const BASIC_COUNT: usize = 8;
+pub const GESTURES: [Gesture; 16] = [
+    Gesture::Left,
+    Gesture::Right,
+    Gesture::Up,
+    Gesture::Down,
+    Gesture::UpLeft,
+    Gesture::UpRight,
+    Gesture::DownLeft,
+    Gesture::DownRight,
+    Gesture::UpDown,
+    Gesture::DownUp,
+    Gesture::LeftRight,
+    Gesture::RightLeft,
+    Gesture::UpThenLeft,
+    Gesture::UpThenRight,
+    Gesture::DownThenLeft,
+    Gesture::DownThenRight,
 ];
 
-impl Direction {
+impl Gesture {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Left => "向左",
@@ -34,6 +51,14 @@ impl Direction {
             Self::UpRight => "右上",
             Self::DownLeft => "左下",
             Self::DownRight => "右下",
+            Self::UpDown => "上再下",
+            Self::DownUp => "下再上",
+            Self::LeftRight => "左再右",
+            Self::RightLeft => "右再左",
+            Self::UpThenLeft => "上再左",
+            Self::UpThenRight => "上再右",
+            Self::DownThenLeft => "下再左",
+            Self::DownThenRight => "下再右",
         }
     }
     pub const fn arrow(self) -> &'static str {
@@ -46,6 +71,14 @@ impl Direction {
             Self::UpRight => "↗",
             Self::DownLeft => "↙",
             Self::DownRight => "↘",
+            Self::UpDown => "↑↓",
+            Self::DownUp => "↓↑",
+            Self::LeftRight => "←→",
+            Self::RightLeft => "→←",
+            Self::UpThenLeft => "↑←",
+            Self::UpThenRight => "↑→",
+            Self::DownThenLeft => "↓←",
+            Self::DownThenRight => "↓→",
         }
     }
 }
@@ -77,16 +110,14 @@ pub const ACTIONS: [Action; 10] = [
     Action::Maximize,
     Action::Close,
 ];
-pub const DEFAULT_BINDINGS: [Action; 8] = [
-    Action::Back,
-    Action::Forward,
-    Action::Home,
-    Action::End,
-    Action::Unassigned,
-    Action::Unassigned,
-    Action::Unassigned,
-    Action::Unassigned,
-];
+pub const DEFAULT_BINDINGS: [Action; GESTURES.len()] = {
+    let mut bindings = [Action::Unassigned; GESTURES.len()];
+    bindings[Gesture::Left as usize] = Action::Back;
+    bindings[Gesture::Right as usize] = Action::Forward;
+    bindings[Gesture::Up as usize] = Action::Home;
+    bindings[Gesture::Down as usize] = Action::End;
+    bindings
+};
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
@@ -103,6 +134,33 @@ impl Action {
         }
     }
 }
+type Axis = (f64, f64);
+const UP: Axis = (0., -1.);
+const DOWN: Axis = (0., 1.);
+const LEFT: Axis = (-1., 0.);
+const RIGHT: Axis = (1., 0.);
+const TWO_LEG: [(Gesture, Axis, Axis); 8] = [
+    (Gesture::UpDown, UP, DOWN),
+    (Gesture::DownUp, DOWN, UP),
+    (Gesture::LeftRight, LEFT, RIGHT),
+    (Gesture::RightLeft, RIGHT, LEFT),
+    (Gesture::UpThenLeft, UP, LEFT),
+    (Gesture::UpThenRight, UP, RIGHT),
+    (Gesture::DownThenLeft, DOWN, LEFT),
+    (Gesture::DownThenRight, DOWN, RIGHT),
+];
+#[derive(Default, Clone, Copy)]
+struct Pivot {
+    position: Axis,
+    length: f64,
+    score: f64,
+}
+
+fn follows_axis((x, y): Axis, length: f64, (ax, ay): Axis) -> bool {
+    let forward = x * ax + y * ay;
+    forward >= 24.0 && forward >= 0.9 * length && (x * ay - y * ax).abs() <= 0.36 * forward
+}
+
 /// Track distance as well as displacement so loops cannot turn into accidental swipes.
 #[derive(Default)]
 pub struct Stroke {
@@ -111,6 +169,7 @@ pub struct Stroke {
     dy: f64,
     length: f64,
     far: f64,
+    pivots: [Pivot; TWO_LEG.len()],
 }
 impl Stroke {
     pub fn new(x: i32, y: i32) -> Self {
@@ -126,12 +185,35 @@ impl Stroke {
         self.dy += dy;
         self.length += dx.hypot(dy);
         self.far = self.far.max(self.dx.hypot(self.dy));
+        // Projection onto the incoming axis minus the outgoing axis peaks at the turn.
+        // Keep that point and its path length, independent of stroke duration.
+        for (pivot, (_, a, b)) in self.pivots.iter_mut().zip(TWO_LEG) {
+            let score = self.dx * (a.0 - b.0) + self.dy * (a.1 - b.1);
+            if score > pivot.score {
+                *pivot = Pivot {
+                    position: (self.dx, self.dy),
+                    length: self.length,
+                    score,
+                };
+            }
+        }
         self.last = (x, y);
     }
     pub fn is_click(&self) -> bool {
         self.far < 8.0
     }
-    pub fn direction(&self) -> Option<Direction> {
+    pub fn gesture(&self) -> Option<Gesture> {
+        for (pivot, (gesture, a, b)) in self.pivots.iter().zip(TWO_LEG) {
+            let tail = (self.dx - pivot.position.0, self.dy - pivot.position.1);
+            if follows_axis(pivot.position, pivot.length, a)
+                && follows_axis(tail, self.length - pivot.length, b)
+            {
+                return Some(gesture);
+            }
+        }
+        self.direction()
+    }
+    fn direction(&self) -> Option<Gesture> {
         let x = self.dx.abs();
         let y = self.dy.abs();
         let displacement = x.hypot(y);
@@ -142,22 +224,22 @@ impl Stroke {
         const TAN_HALF_SECTOR: f64 = std::f64::consts::SQRT_2 - 1.;
         Some(if y <= x * TAN_HALF_SECTOR {
             if self.dx < 0. {
-                Direction::Left
+                Gesture::Left
             } else {
-                Direction::Right
+                Gesture::Right
             }
         } else if x <= y * TAN_HALF_SECTOR {
             if self.dy < 0. {
-                Direction::Up
+                Gesture::Up
             } else {
-                Direction::Down
+                Gesture::Down
             }
         } else {
             match (self.dx < 0., self.dy < 0.) {
-                (true, true) => Direction::UpLeft,
-                (false, true) => Direction::UpRight,
-                (true, false) => Direction::DownLeft,
-                (false, false) => Direction::DownRight,
+                (true, true) => Gesture::UpLeft,
+                (false, true) => Gesture::UpRight,
+                (true, false) => Gesture::DownLeft,
+                (false, false) => Gesture::DownRight,
             }
         })
     }
@@ -167,7 +249,7 @@ mod tests {
     use super::*;
     #[test]
     fn eight_straight_directions_and_sector_boundaries() {
-        use Direction::*;
+        use Gesture::*;
         for (x, y, dir) in [
             (-60, 0, Left),
             (60, 0, Right),
@@ -184,7 +266,7 @@ mod tests {
         ] {
             let mut stroke = Stroke::new(0, 0);
             stroke.sample(x, y);
-            assert_eq!(stroke.direction(), Some(dir));
+            assert_eq!(stroke.gesture(), Some(dir));
         }
     }
     #[test]
@@ -199,14 +281,35 @@ mod tests {
             for (x, y) in points {
                 s.sample(x, y);
             }
-            assert_eq!(s.direction(), None);
+            assert_eq!(s.gesture(), None);
+        }
+    }
+    #[test]
+    fn two_leg_strokes_tolerate_drift_and_do_not_match_a_short_return() {
+        for (expected, a, b) in TWO_LEG {
+            let mut s = Stroke::new(0, 0);
+            let corner = (a.0 * 88.0, a.1 * 88.0);
+            for n in 1..=11 {
+                let step = f64::from(n * 8);
+                s.sample((a.0 * step) as i32 + n % 3, (a.1 * step) as i32);
+            }
+            s.sample((corner.0 + b.0 * 8.) as i32, (corner.1 + b.1 * 8.) as i32);
+            assert_ne!(s.gesture(), Some(expected));
+            for n in 2..=7 {
+                let step = f64::from(n * 8);
+                s.sample(
+                    (corner.0 + b.0 * step) as i32,
+                    (corner.1 + b.1 * step) as i32 + n % 3,
+                );
+            }
+            assert_eq!(s.gesture(), Some(expected));
         }
     }
     #[test]
     fn swipe_on_negative_monitor() {
         let mut s = Stroke::new(-200, 400);
         s.sample(-260, 402);
-        assert_eq!(s.direction(), Some(Direction::Left));
+        assert_eq!(s.gesture(), Some(Gesture::Left));
         assert!(!s.is_click())
     }
     #[test]

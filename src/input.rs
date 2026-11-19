@@ -11,7 +11,7 @@ use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::Keyb
 
 struct Capture {
     target: HWND,
-    bindings: [glidequill::Action; glidequill::DIRECTIONS.len()],
+    bindings: [glidequill::Action; glidequill::GESTURES.len()],
     origin: POINT,
     dpi: u32,
     stroke: Stroke,
@@ -148,7 +148,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             overlay::extend(
                                 SETTINGS_WINDOW.with(Cell::get),
                                 point,
-                                s.stroke.direction().map(|d| s.bindings[d as usize]),
+                                s.stroke.gesture().map(|d| s.bindings[d as usize]),
                             );
                         }
                     }
@@ -170,7 +170,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                         overlay::finish(
                             window,
                             point,
-                            s.stroke.direction().map(|d| s.bindings[d as usize]),
+                            s.stroke.gesture().map(|d| s.bindings[d as usize]),
                         );
                     }
                     true
@@ -250,7 +250,7 @@ mod tests {
             let test_dir =
                 std::env::temp_dir().join(format!("glidequill-bindings-{}", std::process::id()));
             std::fs::create_dir(&test_dir).unwrap();
-            std::fs::write(test_dir.join("settings.json"),r#"{"bindings":["back","forward","home","end","copy","paste","minimize","unassigned"]}"#).unwrap();
+            std::fs::write(test_dir.join("settings.json"),r#"{"bindings":["back","forward","home","end","copy","paste","minimize","unassigned","end","unassigned","unassigned","unassigned","unassigned","copy","unassigned","unassigned"]}"#).unwrap();
             settings::load_from(&test_dir).unwrap();
             std::fs::remove_file(test_dir.join("settings.json")).unwrap();
             std::fs::remove_dir(test_dir).unwrap();
@@ -317,6 +317,19 @@ mod tests {
                     );
                 }
                 assert_eq!(GetForegroundWindow(), hwnd);
+            }
+            // Turning once replaces the initial straight-direction subtitle.
+            for (end, expected) in [(start, "页面底部"), (POINT { x: 380, y: 140 }, "复制")] {
+                assert!(gesture(WM_RBUTTONDOWN, start));
+                gesture(WM_MOUSEMOVE, POINT { x: 280, y: 140 });
+                gesture(WM_MOUSEMOVE, end);
+                overlay::refresh(hwnd);
+                assert_ne!(IsWindowVisible(subtitle), 0);
+                let mut buf = [0; 32];
+                let n = GetWindowTextW(subtitle, buf.as_mut_ptr(), 32);
+                assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), expected);
+                assert!(gesture(WM_RBUTTONUP, end));
+                overlay::refresh(hwnd);
             }
             std::thread::sleep(std::time::Duration::from_millis(600));
             overlay::refresh(hwnd);

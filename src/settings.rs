@@ -18,11 +18,31 @@ pub const RESULT_VALUES: [u32; 5] = [0, 250, 550, 1000, 2000];
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
-    pub bindings: [glidequill::Action; glidequill::DIRECTIONS.len()],
+    #[serde(deserialize_with = "read_bindings")]
+    pub bindings: [glidequill::Action; glidequill::GESTURES.len()],
     pub enabled: bool,
     pub dark: bool,
     pub idle_ms: u32,
     pub result_ms: u32,
+}
+// Preserve bindings saved before the two-leg gestures were introduced.
+fn read_bindings<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<[glidequill::Action; glidequill::GESTURES.len()], D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Saved {
+        Current([glidequill::Action; glidequill::GESTURES.len()]),
+        Basic([glidequill::Action; glidequill::BASIC_COUNT]),
+    }
+    Ok(match Saved::deserialize(d)? {
+        Saved::Current(all) => all,
+        Saved::Basic(basic) => {
+            let mut all = glidequill::DEFAULT_BINDINGS;
+            all[..basic.len()].copy_from_slice(&basic);
+            all
+        }
+    })
 }
 const DEFAULTS: Preferences = Preferences {
     bindings: glidequill::DEFAULT_BINDINGS,

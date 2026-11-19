@@ -12,3 +12,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Security
 [profile.release]
 lto = true
 strip = true
+
+[build-dependencies]
+winresource = { version = "0.1", default-features = false }

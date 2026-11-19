@@ -8,7 +8,7 @@ mod overlay;
 mod settings;
 mod startup;
 mod ui;
-use glidequill::{ACTIONS, Action, DEFAULT_BINDINGS, DIRECTIONS};
+use glidequill::{ACTIONS, Action, BASIC_COUNT, DEFAULT_BINDINGS, GESTURES};
 use std::{
     cell::{Cell, RefCell},
     mem::size_of,
@@ -28,6 +28,15 @@ const EXIT: i32 = 124;
 const THEME: i32 = 127;
 const RESET_RULES: i32 = 136;
 const SAVE_RULES: i32 = 137;
+const BASIC_TAB: i32 = 138;
+const SPECIAL_TAB: i32 = 139;
+fn rule_range() -> std::ops::Range<usize> {
+    if SPECIAL_GROUP.with(Cell::get) {
+        BASIC_COUNT..GESTURES.len()
+    } else {
+        0..BASIC_COUNT
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 enum Page {
@@ -50,10 +59,13 @@ const IDLE: i32 = 132;
 const LINGER: i32 = 133;
 const IDLE_OPTION: i32 = 200;
 const RESULT_OPTION: i32 = 210;
+// Win32 accepts MAKEINTRESOURCE(1) for the executable's first group icon.
+const APP_ICON: *const u16 = std::ptr::without_provenance(1);
 const CLASS: &str = "GlideQuill.Rules.0.1";
 thread_local! {
     static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
     static CONFIG_READABLE:Cell<bool>=const{Cell::new(true)};
+    static SPECIAL_GROUP: Cell<bool> = const { Cell::new(false) };
     static PAGE:Cell<Page>=const{Cell::new(Page::Rules)};
     static STARTUP_ON:Cell<bool>=const{Cell::new(false)};
     static DARK:Cell<bool>=const{Cell::new(false)};
@@ -177,7 +189,7 @@ fn toggle() {
     set_enabled(LISTENER.with(|v| v.borrow().is_none()), true);
 }
 // The native selections are the draft. The listener reads only committed preferences.
-fn selected_bindings() -> Option<[Action; DIRECTIONS.len()]> {
+fn selected_bindings() -> Option<[Action; GESTURES.len()]> {
     let mut bindings = DEFAULT_BINDINGS;
     for (index, binding) in bindings.iter_mut().enumerate() {
         let selected = unsafe {
@@ -194,13 +206,18 @@ fn update_rule_buttons() {
     unsafe {
         for (id, enabled) in [
             (SAVE_RULES, draft.is_some_and(|b| b != saved)),
-            (RESET_RULES, draft.is_some_and(|b| b != DEFAULT_BINDINGS)),
+            (
+                RESET_RULES,
+                draft.is_some_and(|b| b[rule_range()] != DEFAULT_BINDINGS[rule_range()]),
+            ),
         ] {
             let button = GetDlgItem(app_window(), id);
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, enabled.into());
-            InvalidateRect(button, null_mut(), 0);
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
+            if (IsWindowEnabled(button) != 0) != enabled {
+                EnableWindow(button, enabled.into());
+                InvalidateRect(button, null_mut(), 0);
+            }
         }
-        InvalidateRect(app_window(), null_mut(), 0);
     }
 }
 fn save_bindings() {
@@ -377,17 +394,26 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     return 0;
                 }
                 match id {
-                    id if (ui::PICKER..ui::PICKER + DIRECTIONS.len() as i32).contains(&id)
+                    id if (ui::PICKER..ui::PICKER + GESTURES.len() as i32).contains(&id)
                         && matches!((wp >> 16) as u32, CBN_SELCHANGE | CBN_CLOSEUP) =>
                     {
                         update_rule_buttons();
                         InvalidateRect(GetDlgItem(w, id), null_mut(), 0);
                     }
+                    BASIC_TAB | SPECIAL_TAB => {
+                        if SPECIAL_GROUP.with(|v| v.replace(id == SPECIAL_TAB))
+                            != (id == SPECIAL_TAB)
+                        {
+                            ui::layout();
+                            update_rule_buttons();
+                        }
+                    }
                     SAVE_RULES if CONFIG_READABLE.with(Cell::get) => save_bindings(),
                     RESET_RULES if CONFIG_READABLE.with(Cell::get) => {
-                        for (index, action) in DEFAULT_BINDINGS.iter().enumerate() {
+                        for index in rule_range() {
+                            let action = DEFAULT_BINDINGS[index];
                             let field = GetDlgItem(w, ui::PICKER + index as i32);
-                            SendMessageW(field, CB_SETCURSEL, *action as usize, 0);
+                            SendMessageW(field, CB_SETCURSEL, action as usize, 0);
                         }
                         update_rule_buttons();
                     }
@@ -438,6 +464,17 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     TOGGLE => toggle(),
                     OPEN => {
                         ShowWindow(w, SW_RESTORE);
+                        let r = launch_bounds();
+                        SetWindowPos(
+                            w,
+                            null_mut(),
+                            r.left,
+                            r.top,
+                            r.right - r.left,
+                            r.bottom - r.top,
+                            SWP_NOZORDER,
+                        );
+
                         SetForegroundWindow(w);
                     }
                     EXIT => {
@@ -503,13 +540,41 @@ unsafe fn frame_size(dpi: u32) -> RECT {
     let mut frame = RECT {
         left: 0,
         top: 0,
-        right: ui::px(ui::WIDTH),
-        bottom: ui::px(ui::HEIGHT),
+        right: (ui::WIDTH * dpi as i32 + 48) / 96,
+        bottom: (ui::HEIGHT * dpi as i32 + 48) / 96,
     };
     unsafe {
-        AdjustWindowRectExForDpi(&mut frame, WINDOW_STYLE, 0, WS_EX_DLGMODALFRAME, dpi);
+        AdjustWindowRectExForDpi(&mut frame, WINDOW_STYLE, 0, 0, dpi);
     }
     frame
+}
+unsafe fn launch_bounds() -> RECT {
+    unsafe {
+        let mut cursor = POINT::default();
+        GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut info);
+        let mut dpi = GetDpiForSystem();
+        let mut dpi_y = dpi;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) < 0 {
+            dpi = GetDpiForSystem();
+        }
+        let frame = frame_size(dpi);
+        let (width, height) = (frame.right - frame.left, frame.bottom - frame.top);
+        let work = info.rcWork;
+        let x = work.left + ((work.right - work.left - width) / 2).max(0);
+        let y = work.top + ((work.bottom - work.top - height) / 2).max(0);
+        RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        }
+    }
 }
 fn main() {
     unsafe {
@@ -556,20 +621,11 @@ fn main() {
 
         let _graphics = ui::GraphicsSession::start();
         let inst = GetModuleHandleW(null_mut());
-        let image = include_bytes!("quill.png");
-        let icon = CreateIconFromResourceEx(
-            image.as_ptr(),
-            image.len() as u32,
-            1,
-            0x30000,
-            96,
-            96,
-            LR_DEFAULTCOLOR,
-        );
+        let icon = LoadIconW(inst, APP_ICON);
         TRAY_ICON.with(|v| v.set(icon));
         let wc = WNDCLASSW {
             hInstance: inst,
-
+            hIcon: icon,
             lpszClassName: class.as_ptr(),
             lpfnWndProc: Some(proc),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
@@ -579,16 +635,14 @@ fn main() {
         if RegisterClassW(&wc) == 0 {
             return;
         }
-        let dpi = GetDpiForSystem();
-        ui::set_dpi(dpi);
-        let frame = frame_size(dpi);
+        let frame = launch_bounds();
         let hwnd = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            0,
             class.as_ptr(),
-            wide("设置").as_ptr(),
+            wide("GlideQuill · 设置").as_ptr(),
             WINDOW_STYLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            frame.left,
+            frame.top,
             frame.right - frame.left,
             frame.bottom - frame.top,
             null_mut(),
@@ -599,19 +653,11 @@ fn main() {
         if hwnd.is_null() {
             return;
         }
-        let actual_dpi = GetDpiForWindow(hwnd);
-        if actual_dpi != dpi {
-            let actual = frame_size(actual_dpi);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                0,
-                0,
-                actual.right - actual.left,
-                actual.bottom - actual.top,
-                SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE,
-            );
-        }
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as isize);
+        let dpi = GetDpiForWindow(hwnd);
+        let size = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+        let small = LoadImageW(inst, APP_ICON, IMAGE_ICON, size, size, LR_SHARED);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
         update_timing_labels();
         let prefs = settings::preferences();
         apply_theme(hwnd, prefs.dark);
@@ -619,7 +665,7 @@ fn main() {
             label(RESULT, &format!("配置读取失败，已暂停：{e}"));
             for id in [TOGGLE, IDLE, LINGER, THEME]
                 .into_iter()
-                .chain(ui::PICKER..ui::PICKER + DIRECTIONS.len() as i32)
+                .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)
             {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                     GetDlgItem(hwnd, id),
