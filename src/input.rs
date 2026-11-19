@@ -15,15 +15,15 @@ struct Target {
     window: HWND,
     foreground: HWND,
     pid: u32,
-    bindings: settings::Bindings,
+    rules: settings::Resolved,
+    browser: bool,
 }
 #[derive(Clone, Copy)]
 struct PendingShortcut {
     target: HWND,
     pid: u32,
     requested: u32,
-    modifier: Option<u16>,
-    key: u16,
+    shortcut: Shortcut,
 }
 const ACTIVATION_TIMEOUT_MS: u32 = 350;
 const WINDOW_ACTION_DELAY_MS: u32 = 180;
@@ -45,14 +45,56 @@ struct Capture {
     origin: POINT,
     dpi: u32,
     stroke: Stroke,
+    points: glidequill::library::Path,
+    last_shape: Option<Action>,
+    last_match: Option<std::time::Instant>,
+    wheel_delta: i32,
+    used_wheel: bool,
 }
 impl Capture {
     fn sample(&mut self, point: POINT) {
         let scale = 96.0 / self.dpi as f64;
-        self.stroke.sample(
+        let p = [
             ((point.x - self.origin.x) as f64 * scale).round() as i32,
             ((point.y - self.origin.y) as f64 * scale).round() as i32,
+        ];
+        let factor = 24. / f64::from(self.target.rules.tuning.distance);
+        self.stroke.sample(
+            (p[0] as f64 * factor).round() as i32,
+            (p[1] as f64 * factor).round() as i32,
         );
+        if !self.target.rules.shapes.is_empty() {
+            if self.points.is_empty() {
+                self.points.push([0, 0]);
+            }
+            glidequill::library::append_sample(&mut self.points, p);
+        }
+    }
+    fn action(&mut self, final_sample: bool) -> Option<Action> {
+        let rules = &self.target.rules;
+        if !rules.shapes.is_empty()
+            && self.stroke.long_enough()
+            && (final_sample
+                || self
+                    .last_match
+                    .is_none_or(|t| t.elapsed().as_millis() >= 24))
+        {
+            self.last_match = Some(std::time::Instant::now());
+            self.last_shape = glidequill::library::signature(&self.points).and_then(|s| {
+                use glidequill::library::Match;
+                match glidequill::library::closest(
+                    &s,
+                    &rules.shapes,
+                    f64::from(rules.tuning.tolerance) / 100.,
+                ) {
+                    Match::Hit(action) => Some(*action),
+                    Match::Ambiguous => Some(Action::Unassigned),
+                    Match::Miss => None,
+                }
+            });
+        }
+        self.last_shape
+            .or_else(|| self.stroke.gesture().map(|d| rules.bindings[d as usize]))
     }
 }
 thread_local! {
@@ -74,6 +116,7 @@ unsafe fn eligible(point: POINT) -> Option<Target> {
             || target.is_null()
             || target == GetDesktopWindow()
             || target == GetShellWindow()
+            || target == crate::library_ui::recording_window()
             || IsWindowEnabled(target) == 0
             || GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE != 0
         {
@@ -116,7 +159,9 @@ unsafe fn eligible(point: POINT) -> Option<Target> {
             window: target,
             foreground,
             pid,
-            bindings: settings::bindings_for(exe),
+            rules: settings::resolve(exe),
+            browser: exe.eq_ignore_ascii_case("chrome.exe")
+                || exe.eq_ignore_ascii_case("msedge.exe"),
         })
     }
 }
@@ -168,12 +213,20 @@ pub unsafe extern "system" fn foreground_changed(
             unsafe {
                 GetWindowThreadProcessId(hwnd, &mut pid);
                 if pid == pending.pid {
-                    send_shortcut(hwnd, pending.modifier, pending.key);
+                    send_shortcut(hwnd, pending.shortcut);
                 }
             }
         }
     }
     CAPTURE.with_borrow_mut(|capture| {
+        if let Some(s) = capture
+            && s.used_wheel
+            && !s.cancelled
+            && hwnd == s.target.window
+            && event_time.wrapping_sub(s.started) as i32 >= 0
+        {
+            s.target.foreground = hwnd;
+        }
         if let Some(s) = capture
             && !s.cancelled
             && hwnd != s.target.foreground
@@ -242,7 +295,7 @@ unsafe extern "system" fn commit_window_action(_: HWND, _: u32, timer: usize, _:
             && IsIconic(pending.window) == 0
             && GetAsyncKeyState(VK_RBUTTON.into()) >= 0
         {
-            execute(pending.window, pending.action);
+            execute(pending.window, pending.action, false);
         }
     }
 }
@@ -302,17 +355,6 @@ unsafe fn close_window(target: HWND) {
     }
 }
 
-fn shortcut(action: Action) -> Option<(Option<u16>, u16)> {
-    match action {
-        Action::Back => Some((None, VK_BROWSER_BACK)),
-        Action::Forward => Some((None, VK_BROWSER_FORWARD)),
-        Action::Home => Some((None, VK_HOME)),
-        Action::End => Some((None, VK_END)),
-        Action::Copy => Some((Some(VK_CONTROL), VK_C)),
-        Action::Paste => Some((Some(VK_CONTROL), VK_V)),
-        _ => None,
-    }
-}
 fn key_event(key: u16, flags: u32) -> INPUT {
     let scan = unsafe { MapVirtualKeyW(key.into(), MAPVK_VK_TO_VSC_EX) };
     INPUT {
@@ -333,41 +375,68 @@ fn key_event(key: u16, flags: u32) -> INPUT {
     }
 }
 // Submit one complete shortcut to the active application's normal input queue.
-unsafe fn send_shortcut(target: HWND, modifier: Option<u16>, key: u16) {
-    unsafe {
-        let pair = [key_event(key, 0), key_event(key, KEYEVENTF_KEYUP)];
-        let chord;
-        let events = if let Some(modifier) = modifier {
-            chord = [
-                key_event(modifier, 0),
-                pair[0],
-                pair[1],
-                key_event(modifier, KEYEVENTF_KEYUP),
-            ];
-            chord.as_slice()
-        } else {
-            pair.as_slice()
+#[derive(Clone, Copy)]
+enum Shortcut {
+    Keys(glidequill::Chord),
+    BrowserCommand(u32),
+}
+fn shortcut(action: Action, browser: bool) -> Option<Shortcut> {
+    use windows_sys::Win32::System::SystemServices::*;
+    if browser {
+        let command = match action {
+            Action::NewTab => Some(APPCOMMAND_NEW),
+            Action::CloseTab => Some(APPCOMMAND_CLOSE),
+            Action::BrowserHome => Some(APPCOMMAND_BROWSER_HOME),
+            Action::Refresh => Some(APPCOMMAND_BROWSER_REFRESH),
+            _ => None,
         };
-        if GetAsyncKeyState(key.into()) < 0
+        if let Some(c) = command {
+            return Some(Shortcut::BrowserCommand(c));
+        }
+    }
+    action.keys().map(Shortcut::Keys)
+}
+unsafe fn send_shortcut(target: HWND, shortcut: Shortcut) {
+    unsafe {
+        if GetForegroundWindow() != target || modifiers_pressed() {
+            return;
+        }
+        let chord = match shortcut {
+            Shortcut::Keys(c) => c,
+            Shortcut::BrowserCommand(c) => {
+                PostMessageW(target, WM_APPCOMMAND, target as usize, (c << 16) as isize);
+                return;
+            }
+        };
+        let keys: Vec<_> = chord
+            .modifiers()
+            .chain(std::iter::once(chord.key()))
+            .collect();
+        if keys.iter().any(|&key| GetAsyncKeyState(key.into()) < 0)
             || modifiers_pressed()
             || GetForegroundWindow() != target
         {
             return;
         }
+        let events: Vec<_> = keys
+            .iter()
+            .map(|&key| key_event(key, 0))
+            .chain(
+                keys.iter()
+                    .rev()
+                    .map(|&key| key_event(key, KEYEVENTF_KEYUP)),
+            )
+            .collect();
         let size = size_of::<INPUT>() as i32;
         let sent = SendInput(events.len() as u32, events.as_ptr(), size) as usize;
-        if sent > 0 && sent < events.len() {
-            // Only release keys already pressed by the accepted prefix.
-            if sent == usize::from(modifier.is_some()) + 1 {
-                SendInput(1, &pair[1], size);
-            }
-            if let Some(modifier) = modifier {
-                SendInput(1, &key_event(modifier, KEYEVENTF_KEYUP), size);
-            }
+        let held = sent.min(events.len().saturating_sub(sent));
+        if held > 0 {
+            let ups = &events[events.len() - held..];
+            SendInput(ups.len() as u32, ups.as_ptr(), size);
         }
     }
 }
-unsafe fn execute(target: HWND, action: Action) {
+unsafe fn execute(target: HWND, action: Action, browser: bool) {
     unsafe {
         #[cfg(test)]
         {
@@ -379,7 +448,7 @@ unsafe fn execute(target: HWND, action: Action) {
         if modifiers_pressed() {
             return;
         }
-        let Some((modifier, key)) = shortcut(action) else {
+        let Some(shortcut) = shortcut(action, browser) else {
             match action {
                 Action::Minimize | Action::Maximize => change_window_state(target, action),
                 Action::Close => close_window(target),
@@ -388,7 +457,7 @@ unsafe fn execute(target: HWND, action: Action) {
             return;
         };
         if GetForegroundWindow() == target {
-            send_shortcut(target, modifier, key);
+            send_shortcut(target, shortcut);
             return;
         }
 
@@ -398,13 +467,12 @@ unsafe fn execute(target: HWND, action: Action) {
             target,
             pid,
             requested: GetTickCount(),
-            modifier,
-            key,
+            shortcut,
         }));
         if SetForegroundWindow(target) == 0 {
             PENDING.set(None);
         } else if GetForegroundWindow() == target && PENDING.take().is_some() {
-            send_shortcut(target, modifier, key);
+            send_shortcut(target, shortcut);
         }
         // Otherwise the foreground notification completes or cancels the shortcut.
     }
@@ -422,12 +490,57 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
         if ignore {
             return CallNextHookEx(null_mut(), code, msg, data);
         }
+        if msg as u32 == WM_MOUSEWHEEL && wheel((e.mouseData >> 16) as i16 as i32) {
+            return 1;
+        }
         if gesture(msg as u32, e.pt) {
             1
         } else {
             CallNextHookEx(null_mut(), code, msg, data)
         }
     }
+}
+// Partial high-resolution deltas accumulate until a whole detent. Once the
+// wheel owns the press, releasing the button must not replay a context click.
+unsafe fn wheel(delta: i32) -> bool {
+    if delta == 0 {
+        return false;
+    }
+    let mut dispatch = None;
+    let consumed = CAPTURE.with_borrow_mut(|capture| {
+        let Some(s) = capture else {
+            return false;
+        };
+        if s.cancelled
+            || !s.stroke.is_click()
+            || modifiers_pressed()
+            || unsafe { GetForegroundWindow() } != s.target.foreground
+        {
+            return false;
+        }
+        let Some(action) = s.target.rules.wheel[usize::from(delta < 0)] else {
+            return false;
+        };
+        if s.wheel_delta.signum() != delta.signum() {
+            s.wheel_delta = 0;
+        }
+        s.used_wheel = true;
+        s.wheel_delta += delta;
+        let steps = s.wheel_delta.unsigned_abs() / 120;
+        s.wheel_delta %= 120;
+        if steps > 0 {
+            dispatch = Some((s.target.window, action, steps, s.target.browser));
+        }
+        true
+    });
+    if let Some((window, action, steps, browser)) = dispatch {
+        for _ in 0..steps.min(8) {
+            unsafe {
+                execute(window, action, browser);
+            }
+        }
+    }
+    consumed
 }
 unsafe fn gesture(msg: u32, point: POINT) -> bool {
     unsafe {
@@ -463,6 +576,11 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             origin: point,
                             dpi,
                             stroke: Stroke::new(0, 0),
+                            points: Vec::new(),
+                            last_match: None,
+                            wheel_delta: 0,
+                            used_wheel: false,
+                            last_shape: None,
                         })
                     });
                     true
@@ -473,7 +591,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
             WM_MOUSEMOVE => {
                 CAPTURE.with(|c| {
                     if let Some(s) = c.borrow_mut().as_mut() {
-                        if s.cancelled {
+                        if s.cancelled || s.used_wheel {
                             return;
                         }
                         s.sample(point);
@@ -484,7 +602,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             overlay::extend(
                                 SETTINGS_WINDOW.with(Cell::get),
                                 point,
-                                s.stroke.gesture().map(|d| s.target.bindings[d as usize]),
+                                s.action(false),
                             );
                         }
                     }
@@ -498,6 +616,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                     let mut pid = 0;
                     GetWindowThreadProcessId(s.target.window, &mut pid);
                     if s.cancelled
+                        || s.used_wheel
                         || pid != s.target.pid
                         || IsWindowEnabled(s.target.window) == 0
                         || IsIconic(s.target.window) != 0
@@ -511,13 +630,13 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             replay_click();
                         }
                     } else {
-                        let action = s.stroke.gesture().map(|d| s.target.bindings[d as usize]);
+                        let action = s.action(true);
                         if let Some(action) = overlay::finish(window, point, action) {
                             if matches!(action, Action::Minimize | Action::Maximize | Action::Close)
                             {
                                 schedule_window_action(&s.target, action);
                             } else {
-                                execute(s.target.window, action);
+                                execute(s.target.window, action, s.target.browser);
                             }
                         }
                     }
@@ -652,11 +771,11 @@ mod tests {
             .unwrap();
             settings::load_from(&test_dir).unwrap();
             assert_eq!(
-                settings::bindings_for("another.exe")[4],
+                settings::resolve("another.exe").bindings[4],
                 glidequill::Action::Home
             );
             assert_eq!(
-                settings::bindings_for(&name.to_uppercase())[4],
+                settings::resolve(&name.to_uppercase()).bindings[4],
                 glidequill::Action::Copy
             );
             settings::save_exclusions_in(&test_dir, &[name]).unwrap();
@@ -869,8 +988,7 @@ mod tests {
                 target: hwnd,
                 pid,
                 requested,
-                modifier: None,
-                key: VK_HOME,
+                shortcut: Shortcut::Keys("Home".parse().unwrap()),
             }));
             for activated in [GetDesktopWindow(), hwnd] {
                 foreground_changed(
@@ -978,7 +1096,7 @@ mod tests {
             assert!(!edit.is_null());
             SetFocus(edit);
             for (action, key) in [(Action::Copy, VK_C), (Action::Paste, VK_V)] {
-                execute(hwnd, action);
+                execute(hwnd, action, false);
                 assert_eq!(
                     keys(edit, 4),
                     [
@@ -1009,11 +1127,11 @@ mod tests {
             SetForegroundWindow(sample);
             let menu = GetSystemMenu(sample, 0);
             EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_GRAYED);
-            execute(sample, Action::Minimize);
+            execute(sample, Action::Minimize, false);
             let mut msg = MSG::default();
             PeekMessageW(&mut msg, sample, 0, 0, PM_NOREMOVE);
             assert_eq!(IsIconic(sample), 0, "explicitly disabled minimize");
-            execute(sample, Action::Close);
+            execute(sample, Action::Close, false);
             let messages = received(sample, WM_SYSCOMMAND);
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].wParam, SC_CLOSE as usize);

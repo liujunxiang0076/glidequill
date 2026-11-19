@@ -5,6 +5,7 @@ use windows_sys::Win32::UI::HiDpi::*;
 mod engine;
 mod exclusions;
 mod input;
+mod library_ui;
 mod overlay;
 mod rules;
 mod settings;
@@ -314,7 +315,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 ui::set_dpi(GetDpiForWindow(w));
                 ui::measure(w);
                 ui::build();
-                rules::update_buttons();
+                rules::show_scope();
                 ui::layout();
                 if overlay::create().is_err() {
                     return -1;
@@ -455,6 +456,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             rules::update_buttons();
                         }
                     }
+                    library_ui::OPEN_LIBRARY if PAGE.get() == Page::Rules => library_ui::open(w),
                     SAVE_RULES if CONFIG_READABLE.get() => rules::save(),
                     RESET_RULES if CONFIG_READABLE.get() => rules::reset_group(),
                     rules::SCOPE if PAGE.get() == Page::Rules && CONFIG_READABLE.get() => {
@@ -679,6 +681,29 @@ unsafe fn launch_bounds() -> RECT {
         }
     }
 }
+fn enable_config_controls(hwnd: HWND, enabled: bool) {
+    unsafe {
+        for id in [
+            TOGGLE,
+            IDLE,
+            LINGER,
+            THEME_DARK,
+            THEME_LIGHT,
+            FULLSCREEN,
+            EXCLUSIONS,
+            rules::SCOPE,
+        ]
+        .into_iter()
+        .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)
+        .chain(ui::RULE_ROW..ui::RULE_ROW + GESTURES.len() as i32)
+        {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                GetDlgItem(hwnd, id),
+                i32::from(enabled),
+            );
+        }
+    }
+}
 fn main() {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -766,25 +791,7 @@ fn main() {
         apply_theme(hwnd, prefs.dark);
         if let Some(ref e) = error {
             label(RESULT, &format!("配置读取失败，已暂停：{e}"));
-            for id in [
-                TOGGLE,
-                IDLE,
-                LINGER,
-                THEME_DARK,
-                THEME_LIGHT,
-                FULLSCREEN,
-                EXCLUSIONS,
-                rules::SCOPE,
-            ]
-            .into_iter()
-            .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)
-            .chain(ui::RULE_ROW..ui::RULE_ROW + GESTURES.len() as i32)
-            {
-                windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
-                    GetDlgItem(hwnd, id),
-                    0,
-                );
-            }
+            enable_config_controls(hwnd, false);
         } else if prefs.enabled {
             set_enabled(true, false);
         }

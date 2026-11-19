@@ -1,9 +1,10 @@
+use glidequill::library::{Library, Pack, SIGNS, Signature, signature};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{LazyLock, RwLock},
 };
 
 #[derive(Default, Deserialize)]
@@ -62,13 +63,31 @@ struct Configuration {
     prefs: Preferences,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     applications: Applications,
+    #[serde(default = "Library::stock")]
+    library: Library,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_rules: Option<Pack>,
+    #[serde(skip)]
+    shapes: BTreeMap<String, Signature>,
 }
-static CONFIG: RwLock<Configuration> = RwLock::new(Configuration {
-    prefs: DEFAULTS,
-    applications: BTreeMap::new(),
-});
+static CONFIG: LazyLock<RwLock<Configuration>> =
+    LazyLock::new(|| RwLock::new(Configuration::default()));
+pub fn pack() -> Pack {
+    let config = CONFIG.read().unwrap();
+    Pack {
+        bindings: config.prefs.bindings,
+        applications: config.applications.clone(),
+        library: config.library.clone(),
+    }
+}
 pub fn preferences() -> Preferences {
     CONFIG.read().unwrap().prefs
+}
+pub fn library_matches(lib: &Library) -> bool {
+    CONFIG.read().unwrap().library == *lib
+}
+pub fn show_trail() -> bool {
+    CONFIG.read().unwrap().library.tuning.trail
 }
 pub fn applications() -> Applications {
     CONFIG.read().unwrap().applications.clone()
@@ -96,15 +115,31 @@ pub fn rule_changes(global: &Bindings, apps: &Applications) -> usize {
             .filter(|name| !apps.contains_key(*name))
             .count()
 }
-pub fn bindings_for(exe: &str) -> Bindings {
-    let config = CONFIG.read().unwrap();
-    let global = config.prefs.bindings;
-    if config.applications.is_empty() {
-        return global;
-    }
-    match config.applications.get(&exe.to_lowercase()) {
-        Some(overrides) => std::array::from_fn(|i| overrides[i].unwrap_or(global[i])),
-        None => global,
+pub struct Resolved {
+    pub wheel: [Option<glidequill::Action>; 2],
+    pub bindings: Bindings,
+    pub shapes: Vec<(Signature, glidequill::Action)>,
+    pub tuning: glidequill::library::Tuning,
+}
+pub fn resolve(exe: &str) -> Resolved {
+    let c = CONFIG.read().unwrap();
+    let app = c.applications.get(&exe.to_lowercase());
+    let bindings = std::array::from_fn(|i| {
+        app.and_then(|a| a[i])
+            .or_else(|| c.library.action(exe, SIGNS[i]))
+            .unwrap_or(c.prefs.bindings[i])
+    });
+    let shapes = c
+        .shapes
+        .iter()
+        .filter_map(|(sign, shape)| c.library.action(exe, sign).map(|a| (*shape, a)))
+        .collect();
+    Resolved {
+        wheel: glidequill::library::WHEEL
+            .map(|sign| c.library.action(exe, sign).filter(|a| a.keys().is_some())),
+        bindings,
+        shapes,
+        tuning: c.library.tuning,
     }
 }
 pub fn excluded(exe: &str) -> bool {
@@ -149,7 +184,15 @@ pub(super) fn load_from(dir: &Path) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let config = read::<Configuration>(&dir.join("settings.json"))?;
+    let mut config = match fs::read(dir.join("settings.json")) {
+        Ok(bytes) => serde_json::from_slice::<Configuration>(&bytes)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Configuration {
+            library: Library::stock(),
+            ..Default::default()
+        },
+        Err(e) => return Err(e),
+    };
+    config.prepare()?;
     let prefs = config.prefs;
     if !IDLE_VALUES.contains(&prefs.idle_ms) || !RESULT_VALUES.contains(&prefs.result_ms) {
         return Err(io::Error::new(
@@ -168,24 +211,106 @@ fn write_json<T: Serialize + ?Sized>(dir: &Path, name: &str, value: &T) -> io::R
     fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
     fs::rename(temp, dir.join(name))
 }
+impl Configuration {
+    fn prepare(&mut self) -> io::Result<()> {
+        Pack {
+            bindings: self.prefs.bindings,
+            applications: self.applications.clone(),
+            library: self.library.clone(),
+        }
+        .validate()
+        .map_err(io::Error::other)?;
+        self.shapes = self
+            .library
+            .shapes
+            .iter()
+            .filter(|(name, _)| {
+                self.library
+                    .rules
+                    .iter()
+                    .any(|r| r.sign.as_str() == name.as_str())
+            })
+            .filter_map(|(n, p)| signature(p).map(|s| (n.clone(), s)))
+            .collect();
+        Ok(())
+    }
+}
 pub fn save(prefs: Preferences) -> io::Result<()> {
-    persist(prefs, applications())
-}
-pub fn save_rules(bindings: Bindings, applications: Applications) -> io::Result<()> {
-    persist(
-        Preferences {
-            bindings,
-            ..preferences()
-        },
-        applications,
-    )
-}
-fn persist(prefs: Preferences, applications: Applications) -> io::Result<()> {
-    let config = Configuration {
-        prefs,
-        applications,
-    };
+    let mut config = CONFIG.read().unwrap().clone();
+    config.prefs = prefs;
     write_json(&directory()?, "settings.json", &config)?;
     *CONFIG.write().unwrap() = config;
     Ok(())
+}
+pub fn previous() -> io::Result<Pack> {
+    if let Some(previous) = CONFIG.read().unwrap().previous_rules.as_ref() {
+        previous.validate().map_err(io::Error::other)?;
+        return Ok(previous.clone());
+    }
+    let bytes = fs::read(directory()?.join("previous-rules.json"))?;
+    let pack: Pack = serde_json::from_slice(&bytes)?;
+    pack.validate().map_err(io::Error::other)?;
+    Ok(pack)
+}
+pub fn save_pack(next: &Pack) -> io::Result<()> {
+    let mut config = CONFIG.read().unwrap().clone();
+    config.prefs.bindings = next.bindings;
+    config.applications = next.applications.clone();
+    config.library = next.library.clone();
+    config.prepare()?;
+    let dir = directory()?;
+    let previous = pack();
+    config.previous_rules = Some(previous.clone());
+    // The settings file commits both revisions together. The standalone copy
+    // can still be opened if settings.json becomes unreadable.
+    write_json(&dir, "previous-rules.json", &previous)?;
+    write_json(&dir, "settings.json", &config)?;
+    *CONFIG.write().unwrap() = config;
+    Ok(())
+}
+
+pub fn recover_rules(next: &Pack) -> io::Result<PathBuf> {
+    next.validate().map_err(io::Error::other)?;
+    let dir = directory()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let archive = dir.join(format!("recovery-{stamp}"));
+    fs::create_dir(&archive)?;
+    for name in [
+        "settings.json",
+        "excluded.json",
+        "rules.json",
+        "previous-rules.json",
+    ] {
+        match fs::copy(dir.join(name), archive.join(name)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let exclusions = match fs::read(dir.join("excluded.json")) {
+        Ok(v) => serde_json::from_slice::<Vec<String>>(&v).unwrap_or_default(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            read::<Config>(&dir.join("rules.json"))
+                .unwrap_or_default()
+                .excluded
+        }
+        Err(e) => return Err(e),
+    };
+    let mut config = Configuration {
+        prefs: Preferences {
+            bindings: next.bindings,
+            ..Default::default()
+        },
+        applications: next.applications.clone(),
+        library: next.library.clone(),
+        ..Default::default()
+    };
+    config.prepare()?;
+    write_json(&dir, "excluded.json", &exclusions)?;
+    write_json(&dir, "settings.json", &config)?;
+    load_from(&dir)?;
+    Ok(archive)
 }

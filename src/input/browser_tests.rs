@@ -85,7 +85,7 @@ impl Browser {
         std::fs::write(
             &page,
             r##"<!doctype html><meta charset=utf-8><title>GlideQuill action test</title>
-<style>body{height:350vh}a{position:fixed}</style><a autofocus href="#detail">Open detail</a>
+<style>body{height:350vh}a{position:fixed;inset:20%;display:block}</style><a autofocus href="#detail">Open detail</a>
 <script>
 function report() {
   const locationName = location.hash ? 'detail' : 'index';
@@ -184,6 +184,103 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
         }
         panic!("expected {wanted}, observed {}", title(self.window));
     }
+    #[track_caller]
+    fn expect_test_tab(&self, visible: bool) {
+        let start = Instant::now();
+        loop {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            if title(self.window).contains("GlideQuill action test") == visible {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "tab did not change: {} target={:?} foreground={:?}, CTRL={} T={}",
+                title(self.window),
+                self.window,
+                unsafe { GetForegroundWindow() },
+                unsafe { GetAsyncKeyState(17) },
+                unsafe { GetAsyncKeyState(84) }
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+    // Restoring a window animates its bounds. A floating utility may also
+    // cover its center while the surrounding page is visible and interactive.
+    unsafe fn exposed_point(&self) -> POINT {
+        unsafe {
+            let start = Instant::now();
+            let mut previous = None;
+            let mut stable_since = start;
+            loop {
+                let mut rect = RECT::default();
+                assert_ne!(GetWindowRect(self.window, &mut rect), 0);
+                let bounds = (rect.left, rect.top, rect.right, rect.bottom);
+                if previous != Some(bounds) {
+                    previous = Some(bounds);
+                    stable_since = Instant::now();
+                } else if stable_since.elapsed() >= Duration::from_millis(120) {
+                    for y in [50, 35, 65] {
+                        for x in [50, 35, 65] {
+                            let point = POINT {
+                                x: rect.left + (rect.right - rect.left) * x / 100,
+                                y: rect.top + (rect.bottom - rect.top) * y / 100,
+                            };
+                            if GetAncestor(WindowFromPhysicalPoint(point), GA_ROOT) == self.window {
+                                return point;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(4),
+                    "test surface not exposed: {bounds:?}"
+                );
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    fn test_path(&self, offsets: &[[i32; 2]], wheel: Option<i32>) {
+        self.activate();
+        unsafe {
+            let center = self.exposed_point();
+            TEST_TARGET.store(self.window, std::sync::atomic::Ordering::SeqCst);
+            mouse_event_at(center, MOUSEEVENTF_MOVE);
+            mouse_event_at(center, MOUSEEVENTF_RIGHTDOWN);
+            let mut end = center;
+            for &[dx, dy] in offsets {
+                end = POINT {
+                    x: center.x + dx,
+                    y: center.y + dy,
+                };
+                mouse_event_at(end, MOUSEEVENTF_MOVE);
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            if let Some(delta) = wheel {
+                for _ in 0..2 {
+                    let wheel = INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            mi: MOUSEINPUT {
+                                mouseData: (delta / 2) as u32,
+                                dwFlags: MOUSEEVENTF_WHEEL,
+                                dwExtraInfo: TEST_MOUSE_TAG,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    assert_eq!(SendInput(1, &wheel, size_of::<INPUT>() as i32), 1);
+                }
+            }
+            mouse_event_at(end, MOUSEEVENTF_RIGHTUP);
+        }
+    }
     fn swipe(&self, dx: i32, dy: i32) {
         self.activate();
         self.swipe_with_foreground(dx, dy, self.window);
@@ -191,33 +288,7 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
     fn swipe_with_foreground(&self, dx: i32, dy: i32, foreground: HWND) {
         unsafe {
             assert_eq!(GetForegroundWindow(), foreground);
-            // Windows can report the new zoom state before the position and
-            // hit-tested surface have settled during a restore animation.
-            let start = Instant::now();
-            let mut previous = None;
-            let mut stable_since = Instant::now();
-            let center = loop {
-                let mut rect = RECT::default();
-                assert_ne!(GetWindowRect(self.window, &mut rect), 0);
-                let bounds = (rect.left, rect.top, rect.right, rect.bottom);
-                let point = POINT {
-                    x: (rect.left + rect.right) / 2,
-                    y: (rect.top + rect.bottom) / 2,
-                };
-                if previous != Some(bounds)
-                    || GetAncestor(WindowFromPhysicalPoint(point), GA_ROOT) != self.window
-                {
-                    previous = Some(bounds);
-                    stable_since = Instant::now();
-                } else if stable_since.elapsed() >= Duration::from_millis(120) {
-                    break point;
-                }
-                assert!(
-                    start.elapsed() < Duration::from_secs(3),
-                    "test surface not exposed"
-                );
-                std::thread::sleep(Duration::from_millis(15));
-            };
+            let center = self.exposed_point();
             let zoom = IsZoomed(self.window);
             TEST_TARGET.store(self.window, std::sync::atomic::Ordering::SeqCst);
             mouse_event_at(center, MOUSEEVENTF_MOVE);
@@ -356,17 +427,10 @@ fn external_browser_actions() {
         std::thread::sleep(Duration::from_millis(400));
         // Activate the local link to seed real browser history.
         assert_eq!(GetForegroundWindow(), browser.window);
-        let enter = [0, KEYEVENTF_KEYUP].map(|flags| INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VK_RETURN,
-                    dwFlags: flags,
-                    ..Default::default()
-                },
-            },
-        });
-        assert_eq!(SendInput(2, enter.as_ptr(), size_of::<INPUT>() as i32), 2);
+        let link = browser.exposed_point();
+        mouse_event_at(link, MOUSEEVENTF_MOVE);
+        mouse_event_at(link, MOUSEEVENTF_LEFTDOWN);
+        mouse_event_at(link, MOUSEEVENTF_LEFTUP);
         browser.expect_page("detail-top");
         for (dx, dy, state) in [
             (-120, 0, "index-top"),
@@ -380,6 +444,48 @@ fn external_browser_actions() {
             browser.swipe(dx, dy);
             browser.expect_page(state);
         }
+        // Drive the library through the installed hook. All tabs belong to this test profile.
+        let mut pack = glidequill::library::Pack {
+            bindings,
+            ..Default::default()
+        };
+        use glidequill::library::Scope;
+        pack.set(Scope::Global, "Z", Action::End);
+        pack.set(Scope::Global, "UP", Action::NewTab);
+        pack.set(
+            Scope::Global,
+            "DOWN",
+            Action::Keys("Ctrl+Shift+T".parse().unwrap()),
+        );
+        pack.set(Scope::Global, "RIGHT", Action::CloseTab);
+        pack.set(Scope::Global, "WheelSwitchUp", Action::PreviousTab);
+        pack.set(Scope::Global, "WheelSwitchDown", Action::NextTab);
+        std::fs::write(
+            browser.dir.join("settings.json"),
+            serde_json::to_vec(&pack).unwrap(),
+        )
+        .unwrap();
+        settings::load_from(&browser.dir).unwrap();
+        browser.test_path(&[[90, 0], [0, 90], [90, 90]], None);
+        browser.expect_page("detail-end");
+        browser.swipe(0, -120);
+        browser.expect_test_tab(false);
+        browser.test_path(&[], Some(120));
+        browser.expect_test_tab(true);
+        browser.swipe(120, 0);
+        browser.expect_test_tab(false);
+        browser.swipe(0, 120);
+        browser.expect_test_tab(true);
+        browser.test_path(&[], Some(-120));
+        browser.expect_test_tab(false);
+        browser.swipe(120, 0);
+        browser.expect_test_tab(true);
+        std::fs::write(
+            browser.dir.join("settings.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        settings::load_from(&browser.dir).unwrap();
         // A second process owns the foreground while the origin remains visible.
         // Navigation must activate only the browser under the pointer.
         let other = Browser::start("foreground");

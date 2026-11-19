@@ -592,6 +592,16 @@ fn control_bounds(id: i32) -> [i32; 4] {
             (l.height - l.card_top - 116).max(36),
         ],
         SAVE_APPS => [l.right - 100, l.height - 51, 100, 34],
+        library_ui::OPEN_LIBRARY => [
+            l.left,
+            if l.roomy {
+                l.height - 58
+            } else {
+                l.height - 48
+            },
+            96,
+            if l.roomy { 36 } else { 32 },
+        ],
         DIRTY_RULES => {
             let (y, h, space) = if l.roomy {
                 (l.height - 58, 36, 212)
@@ -633,7 +643,7 @@ fn control_bounds(id: i32) -> [i32; 4] {
             34,
         ],
         RESULT => [
-            l.left,
+            l.left + if PAGE.get() == Page::Rules { 104 } else { 0 },
             if l.roomy {
                 l.height - 58
             } else {
@@ -642,7 +652,7 @@ fn control_bounds(id: i32) -> [i32; 4] {
             l.right
                 - l.left
                 - if PAGE.with(Cell::get) == Page::Rules {
-                    if l.roomy { 312 } else { 284 }
+                    if l.roomy { 416 } else { 388 }
                 } else if PAGE.get() == Page::Exclusions {
                     108
                 } else {
@@ -695,6 +705,7 @@ fn controls() -> impl Iterator<Item = i32> {
         DIRTY_RULES,
         GENERAL_SCROLL,
         rules::SCOPE,
+        library_ui::OPEN_LIBRARY,
         TOGGLE,
         AUTOSTART,
         IDLE,
@@ -723,7 +734,7 @@ fn visible_on(id: i32, page: Page) -> bool {
         THEME_LIGHT | THEME_DARK | FULLSCREEN | EXCLUSIONS | AUTOSTART => false,
         IDLE | LINGER => page == Page::Feedback,
         ADD_APP | REMOVE_APP | SAVE_APPS | BACK | APP_LIST => page == Page::Exclusions,
-        DIRTY_RULES | rules::SCOPE => page == Page::Rules,
+        DIRTY_RULES | rules::SCOPE | library_ui::OPEN_LIBRARY => page == Page::Rules,
         TOGGLE => matches!(page, Page::Rules | Page::General),
         RESET_RULES | SAVE_RULES | BASIC_TAB | CORNER_TAB | RETURN_TAB => page == Page::Rules,
         id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
@@ -873,6 +884,7 @@ pub unsafe fn build() {
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
             (rules::SCOPE, "通用规则  ▾"),
+            (library_ui::OPEN_LIBRARY, "手势库…"),
             (BASIC_TAB, "基础方向"),
             (RETURN_TAB, "往返手势"),
             (CORNER_TAB, "转角手势"),
@@ -939,7 +951,12 @@ pub unsafe fn build() {
             );
             let row = SendMessageW(catalog, LB_ADDSTRING, 0, wide(&name).as_ptr() as isize);
             if row >= 0 {
-                SendMessageW(catalog, LB_SETITEMDATA, row as usize, action as isize);
+                SendMessageW(
+                    catalog,
+                    LB_SETITEMDATA,
+                    row as usize,
+                    action.index() as isize,
+                );
             }
         }
         control(
@@ -989,7 +1006,7 @@ pub unsafe fn build() {
             SendMessageW(
                 field,
                 CB_SETCURSEL,
-                settings::preferences().bindings[index] as usize,
+                settings::preferences().bindings[index].index(),
                 0,
             );
             SetWindowSubclass(field, Some(action_field), 1, 0);
@@ -1547,7 +1564,14 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             );
         } else if matches!(
             id,
-            RESET_RULES | SAVE_RULES | ADD_APP | REMOVE_APP | SAVE_APPS | BACK | rules::SCOPE
+            RESET_RULES
+                | SAVE_RULES
+                | ADD_APP
+                | REMOVE_APP
+                | SAVE_APPS
+                | BACK
+                | rules::SCOPE
+                | library_ui::OPEN_LIBRARY
         ) {
             let enabled = IsWindowEnabled(item.hwndItem) != 0;
             let primary = enabled && matches!(id, SAVE_RULES | SAVE_APPS);

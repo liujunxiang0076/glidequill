@@ -13,12 +13,14 @@ struct Draft {
     global: Bindings,
     apps: Applications,
     scope: Option<String>,
+    library: glidequill::library::Library,
 }
 thread_local! {
     static DRAFT: RefCell<Draft> = RefCell::new(Draft {
         global: settings::preferences().bindings,
         apps: settings::applications(),
         scope: None,
+        library:settings::pack().library,
     });
 }
 
@@ -29,18 +31,34 @@ pub fn clear_index() -> usize {
     if is_application() {
         INHERIT
     } else {
-        Action::Unassigned as usize
+        Action::Unassigned.index()
     }
 }
-fn inherited_label(action: Action) -> String {
-    format!("跟随通用 · {}", action.label())
+fn inherited_label(d: &Draft, i: usize) -> String {
+    if let Some(app) = &d.scope
+        && let Some(action) = d.library.action(app, glidequill::library::SIGNS[i])
+    {
+        return format!("跟随应用组 · {}", action.display());
+    }
+    format!("跟随通用 · {}", d.global[i].display())
 }
 pub fn option_label(id: i32, option: usize) -> Option<String> {
-    if option == INHERIT {
-        Some(DRAFT.with_borrow(|d| inherited_label(d.global[(id - ui::PICKER) as usize])))
-    } else {
-        ACTIONS.get(option).map(|action| action.label().to_owned())
+    if let Some(a) = ACTIONS.get(option) {
+        return Some(a.label().into());
     }
+    let i = (id - ui::PICKER) as usize;
+    DRAFT.with_borrow(|d| {
+        if d.scope.is_some() && option == INHERIT {
+            return Some(inherited_label(d, i));
+        }
+        let a = if let Some(name) = &d.scope {
+            d.apps[name][i]
+        } else {
+            Some(d.global[i])
+        };
+        a.filter(|a| matches!(a, Action::Keys(_)))
+            .map(Action::display)
+    })
 }
 pub fn field_changed(id: i32) {
     let selection = unsafe { SendMessageW(GetDlgItem(app_window(), id), CB_GETCURSEL, 0, 0) };
@@ -49,6 +67,9 @@ pub fn field_changed(id: i32) {
     }
     let index = (id - ui::PICKER) as usize;
     let action = ACTIONS.get(selection as usize).copied();
+    if action.is_none() && !(is_application() && selection as usize == INHERIT) {
+        return;
+    }
     DRAFT.with_borrow_mut(|d| {
         if let Some(bindings) = d.scope.as_ref().and_then(|name| d.apps.get_mut(name)) {
             bindings[index] = action;
@@ -59,7 +80,7 @@ pub fn field_changed(id: i32) {
     update_buttons();
 }
 // Native controls may synchronously paint during SendMessage. Release the draft borrow first.
-fn show_scope() {
+pub fn show_scope() {
     let (name, global, overrides) = DRAFT.with_borrow(|d| {
         (
             d.scope.clone(),
@@ -74,15 +95,31 @@ fn show_scope() {
     for (i, action) in global.into_iter().enumerate() {
         unsafe {
             let field = GetDlgItem(app_window(), ui::PICKER + i as i32);
-            if SendMessageW(field, CB_GETCOUNT, 0, 0) > INHERIT as isize {
+            while SendMessageW(field, CB_GETCOUNT, 0, 0) > INHERIT as isize {
                 SendMessageW(field, CB_DELETESTRING, INHERIT, 0);
             }
             let selection = if let Some(bindings) = overrides {
-                let text = wide(&inherited_label(action));
+                let text = wide(&DRAFT.with_borrow(|d| inherited_label(d, i)));
                 SendMessageW(field, CB_ADDSTRING, 0, text.as_ptr() as isize);
-                bindings[i].map_or(INHERIT, |a| a as usize)
+                if let Some(Action::Keys(c)) = bindings[i] {
+                    SendMessageW(
+                        field,
+                        CB_ADDSTRING,
+                        0,
+                        wide(&c.to_string()).as_ptr() as isize,
+                    ) as usize
+                } else {
+                    bindings[i].map_or(INHERIT, |a| a.index())
+                }
+            } else if let Action::Keys(c) = action {
+                SendMessageW(
+                    field,
+                    CB_ADDSTRING,
+                    0,
+                    wide(&c.to_string()).as_ptr() as isize,
+                ) as usize
             } else {
-                action as usize
+                action.index()
             };
             SendMessageW(field, CB_SETCURSEL, selection, 0);
         }
@@ -111,7 +148,11 @@ pub fn update_buttons() {
             Some(name) => d.apps[name][range].iter().any(Option::is_some),
             None => d.global[range.clone()] != DEFAULT_BINDINGS[range],
         };
-        (settings::rule_changes(&d.global, &d.apps), can_reset)
+        (
+            settings::rule_changes(&d.global, &d.apps)
+                + usize::from(!settings::library_matches(&d.library)),
+            can_reset,
+        )
     });
     label(
         DIRTY_RULES,
@@ -138,7 +179,7 @@ pub fn reset_group() {
         let selection = if app {
             INHERIT
         } else {
-            DEFAULT_BINDINGS[i] as usize
+            DEFAULT_BINDINGS[i].index()
         };
         unsafe {
             SendMessageW(
@@ -160,7 +201,7 @@ pub fn reset_group() {
     update_buttons();
 }
 pub fn save() {
-    match DRAFT.with_borrow(|d| settings::save_rules(d.global, d.apps.clone())) {
+    match settings::save_pack(&draft_pack()) {
         Ok(()) => label(RESULT, "规则已保存并重载，将用于下一笔手势"),
         Err(e) => label(RESULT, &format!("保存失败，修改已保留：{e}")),
     }
@@ -254,5 +295,27 @@ pub fn scope_command(id: i32) {
         _ => return,
     };
     DRAFT.with_borrow_mut(|d| d.scope = scope);
+    show_scope();
+}
+
+pub fn draft_pack() -> glidequill::library::Pack {
+    DRAFT.with_borrow(|d| glidequill::library::Pack {
+        bindings: d.global,
+        applications: d.apps.clone(),
+        library: d.library.clone(),
+    })
+}
+pub fn replace_draft(pack: glidequill::library::Pack) {
+    DRAFT.with_borrow_mut(|d| {
+        d.global = pack.bindings;
+        d.apps = pack.applications;
+        d.library = pack.library;
+        if d.scope
+            .as_ref()
+            .is_some_and(|name| !d.apps.contains_key(name))
+        {
+            d.scope = None;
+        }
+    });
     show_scope();
 }

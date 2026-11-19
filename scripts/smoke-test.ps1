@@ -32,9 +32,11 @@ public static class GestureSmoke {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
     [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr w, IntPtr rect, IntPtr region, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr w,uint kind);
     [DllImport("user32.dll")] public static extern IntPtr GetLastActivePopup(IntPtr owner);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool PostMessage(IntPtr w,uint msg,IntPtr wp,IntPtr lp);
     [DllImport("user32.dll",CharSet=CharSet.Unicode,EntryPoint="SendMessageW")] public static extern IntPtr SendText(IntPtr w,uint msg,IntPtr id,string value);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="SendMessageW")] public static extern IntPtr ReadText(IntPtr w,uint msg,IntPtr size,StringBuilder buffer);
     delegate bool EnumProc(IntPtr h,IntPtr l);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr w,EnumProc proc,IntPtr l);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr w);
@@ -44,7 +46,8 @@ public static class GestureSmoke {
         EnumChildWindows(dialog,(h,l)=>{
             var name=new StringBuilder(64);
             GetClassName(h,name,64);
-            if(GetDlgCtrlID(h)==1148 && name.ToString()=="Edit") edit=h;
+            int id=GetDlgCtrlID(h);
+            if((id==1148 || id==1001) && name.ToString()=="Edit") edit=h;
             return edit==IntPtr.Zero;
         },IntPtr.Zero);
         return edit;
@@ -74,7 +77,7 @@ function Show-TestDialog($w,$command) {
     Require ([GestureSmoke]::PostMessage($w,0x111,[IntPtr]$command,[IntPtr]::Zero)) 'Dialog command failed'
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do {
-        $dialog=[GestureSmoke]::GetLastActivePopup($w)
+        $dialog=[GestureSmoke]::GetLastActivePopup([GestureSmoke]::GetAncestor($w,3))
         if ($dialog -ne $w -and [GestureSmoke]::IsWindowVisible($dialog)) { return $dialog }
         Start-Sleep -Milliseconds 25
     } while ($timer.ElapsedMilliseconds -lt 5000)
@@ -116,7 +119,7 @@ function Save-Screenshot($w,$name) {
     }
     finally { $bmp.Dispose() }
 }
-function Select-TestExecutable($w,$command) {
+function Select-TestFile($w,$command,$path) {
     $dialog=Show-TestDialog $w $command
     $timer=[Diagnostics.Stopwatch]::StartNew()
     do {
@@ -124,8 +127,8 @@ function Select-TestExecutable($w,$command) {
         if ($edit -ne 0) {break}
         Start-Sleep -Milliseconds 25
     } while ($timer.ElapsedMilliseconds -lt 5000)
-    Require ($edit -ne 0) 'Native filename editor missing'
-    [void][GestureSmoke]::SendText($edit,0x0c,[IntPtr]::Zero,$exe)
+    Require ($edit -ne 0) "Native filename editor missing for command $command"
+    [void][GestureSmoke]::SendText($edit,0x0c,[IntPtr]::Zero,$path)
     Close-TestDialog $dialog 1
 }
 function Require($condition,$message) { if (!$condition) { throw $message } }
@@ -217,7 +220,7 @@ try {
     foreach ($i in 0..7) {
         Require ((Get-Label $w (140+$i)) -eq $names[$i]) 'Wrong direction'
         $field=[GestureSmoke]::GetDlgItem($w,(160+$i))
-        Require ((Send $field 0x146).ToInt32() -eq 10) 'Missing choices'
+        Require ((Send $field 0x146).ToInt32() -eq 20) 'Missing choices'
         Require ((Send $field 0x147).ToInt32() -eq $defaults[$i]) 'Wrong default action'
     }
     foreach ($id in @(110,120,125,126)) {
@@ -226,8 +229,8 @@ try {
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
     [void](Send ([GestureSmoke]::GetDlgItem($w,196)) 0xf5)
     $catalog=[GestureSmoke]::GetDlgItem($w,197)
-    Require ([GestureSmoke]::IsWindowVisible($catalog) -and (Send $catalog 0x18b).ToInt32() -eq 9) 'Action catalog incomplete'
-    foreach ($index in 0..8) {
+    Require ([GestureSmoke]::IsWindowVisible($catalog) -and (Send $catalog 0x18b).ToInt32() -eq 19) 'Action catalog incomplete'
+    foreach ($index in 0..18) {
         Require ((Send $catalog 0x199 $index).ToInt32() -eq ($index+1)) 'Action catalog differs from binding options'
     }
     Save-Screenshot $w 'windows-actions.png'
@@ -299,10 +302,10 @@ try {
     # Stage an explicit disable and an override while the remaining gestures inherit.
     $common=[GestureSmoke]::GetDlgItem($w,160)
     $appKey=[IO.Path]::GetFileName($exe).ToLowerInvariant()
-    Select-TestExecutable $w 194
+    Select-TestFile $w 194 $exe
     $scopeTimer=[Diagnostics.Stopwatch]::StartNew()
     while ((Get-Label $w 192) -notlike "*$appKey*" -and $scopeTimer.ElapsedMilliseconds -lt 3000) { Start-Sleep -Milliseconds 25 }
-    Require ((Get-Label $w 192) -like "*$appKey*" -and (Send $common 0x147).ToInt32() -eq 10) 'Application did not start with inheritance'
+    Require ((Get-Label $w 192) -like "*$appKey*" -and (Send $common 0x147).ToInt32() -eq 20) 'Application did not start with inheritance'
     [void](Send $common 0x14e 0)
     [void](Send $w 0x111 (0x10000+160) $common)
     [void](Send $diagonal 0x14e 6)
@@ -320,7 +323,7 @@ try {
     Require ($profile[0] -eq 'unassigned' -and $null -eq $profile[1] -and $profile[5] -eq 'paste') 'Inheritance and explicit unbinding were not persisted distinctly'
     Save-Screenshot $w 'windows-app-rules.png'
     [void](Send $w 0x111 193)
-    Select-TestExecutable $w 194
+    Select-TestFile $w 194 $exe
     $scopeTimer.Restart()
     while ((Get-Label $w 192) -notlike "*$appKey*" -and $scopeTimer.ElapsedMilliseconds -lt 3000) { Start-Sleep -Milliseconds 25 }
     Require ((Get-Label $w 192) -like "*$appKey*") 'Duplicate file selection did not switch scope'
@@ -392,7 +395,7 @@ try {
     Require ((Get-Content $exclusionsFile -Raw).Trim() -eq '[]') 'Empty override not persisted'
     # Choose a real executable twice; the second choice selects the existing draft entry.
     foreach ($round in 1..2) {
-        Select-TestExecutable $w 184
+        Select-TestFile $w 184 $exe
         $timer=[Diagnostics.Stopwatch]::StartNew()
         while ((Send $list 0x18b).ToInt32() -ne 1 -and $timer.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
         Require ((Send $list 0x18b).ToInt32() -eq 1) 'File picker missed or duplicated executable'
@@ -460,7 +463,7 @@ try {
     [void](Send $w 0x111 300)
     Require ((Get-Label $w 192) -like "*$appKey*" -and (Send ([GestureSmoke]::GetDlgItem($w,160)) 0x147).ToInt32() -eq 0) 'Saved application overrides did not survive a restart'
     [void](Send $w 0x111 136)
-    Require ((Send ([GestureSmoke]::GetDlgItem($w,160)) 0x147).ToInt32() -eq 10) 'Application reset did not restore inheritance'
+    Require ((Send ([GestureSmoke]::GetDlgItem($w,160)) 0x147).ToInt32() -eq 20) 'Application reset did not restore inheritance'
     [void](Send $w 0x111 195)
     Require ((Get-Content $prefsFile -Raw | ConvertFrom-Json).applications.$appKey[5] -eq 'paste') 'Removing an app bypassed Save'
     [void](Send $w 0x111 137)
@@ -479,9 +482,96 @@ try {
     $start.Arguments=''
     $p=Start-TestApp
     Require ((Get-Label $p.MainWindowHandle 121) -eq '启用全局手势') 'Paused state not restored'
+    $w=$p.MainWindowHandle
+    [void](Send $w 0x111 134)
+    $before=(Get-FileHash $prefsFile).Hash
+    $library=Show-TestDialog $w 198
+    $signs=[GestureSmoke]::GetDlgItem($library,511)
+    Require ((Send $signs 0x146).ToInt32() -eq 38) 'Template and wheel catalog missing'
+    function Set-TestField($dialog,$id,$text){
+        [void][GestureSmoke]::SendText([GestureSmoke]::GetDlgItem($dialog,$id),0x0c,[IntPtr]::Zero,$text)
+    }
+    Set-TestField $library 516 '测试组'
+    Set-TestField $library 517 'one.exe, two.exe'
+    [void](Send $library 0x111 518)
+    Set-TestField $library 511 'LEFT'
+    Set-TestField $library 512 'Ctrl+Alt+F12'
+    [void](Send $library 0x111 513)
+    $record=Show-TestDialog $library 527
+    $canvas=[GestureSmoke]::GetDlgItem($record,532)
+    [void](Send $canvas 0x201 1 0x00100010)
+    [void](Send $canvas 0x200 1 0x00200040)
+    [void](Send $canvas 0x202 0 0x00500048)
+    Set-TestField $record 530 '测试轨迹'
+    Close-TestDialog $record 1
+    Set-TestField $library 512 'Ctrl+Shift+T'
+    [void](Send $library 0x111 513)
+    Close-TestDialog $library 1
+    Require ((Get-FileHash $prefsFile).Hash -eq $before) 'Library edited disk before save'
+    [void](Send $w 0x111 137)
+    $saved=Get-Content -Encoding utf8 -Raw $prefsFile | ConvertFrom-Json
+    Require ($saved.library.groups.'测试组'.Count -eq 2 -and $saved.library.shapes.'测试轨迹'.Count -ge 3) 'Group or recording did not survive save'
+    Require (@($saved.library.rules|Where-Object {$_.action.keys -eq 'Ctrl+Alt+F12'}).Count -eq 1) 'Edited chord was not saved'
+    Require (Test-Path -LiteralPath (Join-Path $legacyDir 'previous-rules.json')) 'Missing rule rollback'
+    $after=(Get-FileHash $prefsFile).Hash
+    $library=Show-TestDialog $w 198
+    $export=Join-Path $root 'test-rules.json'
+    Select-TestFile $library 524 $export
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    while (!(Test-Path -LiteralPath $export) -and $timer.ElapsedMilliseconds -lt 5000) {Start-Sleep -Milliseconds 25}
+    Require (Test-Path -LiteralPath $export) "Rule export failed: $(Get-Label $library 529)"
+    Require ((Get-Content -Encoding utf8 -Raw $export | ConvertFrom-Json).rules.library.groups.'测试组'.Count -eq 2) 'Portable rule pack export lost the group'
+    $source=Join-Path $root 'test-mouseinc.json'
+    [IO.File]::WriteAllText($source,'{"Gestures":[],"MatchGlobal":[{"Sign":"UP","Valid":true,"Actions":[["SendKeys","Ctrl+F"]]}]}')
+    Select-TestFile $library 523 $source
+    function Wait-TestPopup($owner,$field) {
+        $timer=[Diagnostics.Stopwatch]::StartNew()
+        do {
+            $popup=[GestureSmoke]::GetLastActivePopup([GestureSmoke]::GetAncestor($owner,3))
+            if ($popup -ne $owner -and [GestureSmoke]::IsWindowVisible($popup) -and [GestureSmoke]::GetDlgItem($popup,$field) -ne 0) {return $popup}
+            Start-Sleep -Milliseconds 25
+        } while ($timer.ElapsedMilliseconds -lt 5000)
+        throw "Missing dialog for control $field. $(Get-Label $owner 529)"
+    }
+    $scopes=Wait-TestPopup $library 542
+    Close-TestDialog $scopes 1
+    $preview=Wait-TestPopup $library 541
+    $detail=[Text.StringBuilder]::new(512)
+    [void][GestureSmoke]::ReadText([GestureSmoke]::GetDlgItem($preview,541),0x0d,[IntPtr]512,$detail)
+    Require ($detail.ToString() -like '*Ctrl+F*') "Import preview lost its key binding: $detail"
+    Close-TestDialog $preview 1
+    Close-TestDialog $library 2
+    Require ((Get-FileHash $prefsFile).Hash -eq $after -and ![GestureSmoke]::IsWindowEnabled([GestureSmoke]::GetDlgItem($w,137))) 'Discarding a migration changed active rules'
     [void](Send $p.MainWindowHandle 0x111 124)
     Require ($p.WaitForExit(5000)) 'Final exit failed'
-    Write-Output 'PASS: centered branded window, embedded icon, basic and two-leg bindings, per-app overrides and inheritance, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray and legacy configuration.'
+    # Restore into a new process that cannot decode its primary configuration.
+    [IO.File]::WriteAllText($prefsFile,'{damaged')
+    [IO.File]::WriteAllText($exclusionsFile,'["keep.exe"]')
+    $p=Start-TestApp
+    $w=$p.MainWindowHandle
+    [void](Send $w 0x111 134)
+    $library=Show-TestDialog $w 198
+    $preview=Show-TestDialog $library 525
+    Close-TestDialog $preview 1
+    Close-TestDialog $library 1
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        $confirm=[GestureSmoke]::GetLastActivePopup($w)
+        if ($confirm -ne $w -and (Get-Label $confirm 540) -like '*损坏配置恢复*') {break}
+        Start-Sleep -Milliseconds 25
+    } while ($timer.ElapsedMilliseconds -lt 5000)
+    Require ((Get-Label $confirm 540) -like '*损坏配置恢复*') 'Recovery confirmation missing'
+    Close-TestDialog $confirm 1
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    while ([IO.File]::ReadAllText($prefsFile) -eq '{damaged' -and $timer.ElapsedMilliseconds -lt 5000) {Start-Sleep -Milliseconds 25}
+    $restored=Get-Content -Encoding utf8 -Raw $prefsFile | ConvertFrom-Json
+    Require (!$restored.enabled -and $restored.bindings[0] -eq $saved.previous_rules.bindings[0]) 'Recovery did not load a paused rule snapshot'
+    Require ((Get-Content -Raw $exclusionsFile | ConvertFrom-Json) -contains 'keep.exe') 'Recovery lost valid exclusions'
+    $backup=Get-ChildItem -LiteralPath $legacyDir -Directory -Filter 'recovery-*' | Select-Object -First 1
+    Require ($backup -and [IO.File]::ReadAllText((Join-Path $backup.FullName 'settings.json')) -eq '{damaged') 'Original damaged file was lost'
+    [void](Send $w 0x111 124)
+    Require ($p.WaitForExit(5000)) 'Recovered instance exit failed'
+    Write-Output 'PASS: centered branded window, embedded icon, basic and two-leg bindings, per-app overrides and inheritance, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray, recording, application groups, custom keys, migration preview, export and corrupt configuration recovery.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     if (Test-Path -LiteralPath $testKey) {Remove-Item -LiteralPath $testKey}

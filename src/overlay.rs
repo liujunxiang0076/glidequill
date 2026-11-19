@@ -252,21 +252,26 @@ pub unsafe fn refresh(window: HWND) {
         );
         state.dirty = false;
         drop(state);
-        if draw(
-            popup,
-            &points,
-            dpi,
-            if released {
-                match action {
-                    None => Some("未识别"),
-                    Some(Action::Unassigned) => Some("未绑定"),
-                    _ => None,
-                }
-            } else {
-                None
-            },
-        ) {
-            if IsWindowVisible(popup) == 0 {
+        let show_trail = settings::show_trail();
+        if !show_trail
+            || draw(
+                popup,
+                &points,
+                dpi,
+                if released {
+                    match action {
+                        None => Some("未识别"),
+                        Some(Action::Unassigned) => Some("未绑定"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                },
+            )
+        {
+            if !show_trail {
+                ShowWindow(popup, SW_HIDE);
+            } else if IsWindowVisible(popup) == 0 {
                 ShowWindow(popup, SW_SHOWNOACTIVATE);
             }
             if let (Some(action), Some(&end)) =
@@ -575,7 +580,8 @@ unsafe fn show_subtitle(action: Action, end: POINT, fallback_dpi: u32) {
         let scale = dpi as f32 / 96.;
         let px = |v: f32| (v * scale).round() as i32;
         let work = info.rcWork;
-        let label = action.label();
+        let text = action.display();
+        let label = text.as_str();
         let width = px(48. + label.chars().count() as f32 * 23.).min(work.right - work.left);
         let height = px(48.).min(work.bottom - work.top);
         let subtitle = Subtitle {

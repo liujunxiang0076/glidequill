@@ -1,3 +1,7 @@
+pub mod chord;
+pub mod library;
+pub mod migration;
+pub use chord::Chord;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,8 +123,19 @@ pub enum Action {
     Minimize,
     Maximize,
     Close,
+    Refresh,
+    HardRefresh,
+    PreviousTab,
+    NextTab,
+    NewTab,
+    CloseTab,
+    ReopenTab,
+    BrowserHome,
+    Escape,
+    Delete,
+    Keys(Chord),
 }
-pub const ACTIONS: [Action; 10] = [
+pub const ACTIONS: [Action; 20] = [
     Action::Unassigned,
     Action::Back,
     Action::Forward,
@@ -131,6 +146,16 @@ pub const ACTIONS: [Action; 10] = [
     Action::Minimize,
     Action::Maximize,
     Action::Close,
+    Action::Refresh,
+    Action::HardRefresh,
+    Action::PreviousTab,
+    Action::NextTab,
+    Action::NewTab,
+    Action::CloseTab,
+    Action::ReopenTab,
+    Action::BrowserHome,
+    Action::Escape,
+    Action::Delete,
 ];
 pub const DEFAULT_BINDINGS: [Action; GESTURES.len()] = {
     let mut bindings = [Action::Unassigned; GESTURES.len()];
@@ -141,11 +166,56 @@ pub const DEFAULT_BINDINGS: [Action; GESTURES.len()] = {
     bindings
 };
 impl Action {
+    pub fn index(self) -> usize {
+        ACTIONS
+            .iter()
+            .position(|&a| a == self)
+            .unwrap_or(ACTIONS.len())
+    }
+    pub fn display(self) -> String {
+        match self {
+            Self::Keys(c) => c.to_string(),
+            a => a.label().into(),
+        }
+    }
+    pub fn keys(self) -> Option<Chord> {
+        let text = match self {
+            Self::Keys(c) => return Some(c),
+            Self::Back => "Back",
+            Self::Forward => "Forward",
+            Self::Home => "Home",
+            Self::End => "End",
+            Self::Copy => "Ctrl+C",
+            Self::Paste => "Ctrl+V",
+            Self::Refresh => "Ctrl+R",
+            Self::HardRefresh => "Ctrl+Shift+R",
+            Self::PreviousTab => "Ctrl+PgUp",
+            Self::NextTab => "Ctrl+PgDn",
+            Self::NewTab => "Ctrl+T",
+            Self::CloseTab => "Ctrl+W",
+            Self::ReopenTab => "Ctrl+Shift+T",
+            Self::BrowserHome => "Alt+Home",
+            Self::Escape => "Esc",
+            Self::Delete => "Del",
+            _ => return None,
+        };
+        text.parse().ok()
+    }
+
     pub fn category(self) -> &'static str {
         match self {
             Self::Back | Self::Forward | Self::Home | Self::End => "导航",
             Self::Copy | Self::Paste => "编辑",
             Self::Minimize | Self::Maximize | Self::Close => "窗口",
+            Self::Refresh
+            | Self::HardRefresh
+            | Self::PreviousTab
+            | Self::NextTab
+            | Self::NewTab
+            | Self::CloseTab
+            | Self::ReopenTab
+            | Self::BrowserHome => "浏览器",
+            Self::Escape | Self::Delete | Self::Keys(_) => "按键",
             Self::Unassigned => "绑定选项",
         }
     }
@@ -160,11 +230,33 @@ impl Action {
             Self::Minimize => "将起笔时的窗口收起到任务栏。",
             Self::Maximize => "放大到工作区，再划一次恢复原来的大小。",
             Self::Close => "请求关闭当前窗口，由应用处理保存提示。",
+            Self::Refresh => "向起笔窗口发送 Ctrl+R。",
+            Self::HardRefresh => "向起笔窗口发送 Ctrl+Shift+R。",
+            Self::PreviousTab => "向起笔窗口发送 Ctrl+PgUp。",
+            Self::NextTab => "向起笔窗口发送 Ctrl+PgDn。",
+            Self::NewTab => "向起笔窗口发送 Ctrl+T。",
+            Self::CloseTab => "向起笔窗口发送 Ctrl+W。",
+            Self::ReopenTab => "向起笔窗口发送 Ctrl+Shift+T。",
+            Self::BrowserHome => "向起笔窗口发送 Alt+Home。",
+            Self::Escape => "向起笔窗口发送 Esc。",
+            Self::Delete => "向起笔窗口发送 Del。",
+            Self::Keys(_) => "向起笔窗口发送已设置的快捷键。",
             Self::Unassigned => "识别到该手势时跳过动作。",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Refresh => "刷新页面",
+            Self::HardRefresh => "强制刷新",
+            Self::PreviousTab => "上一个标签页",
+            Self::NextTab => "下一个标签页",
+            Self::NewTab => "新建标签页",
+            Self::CloseTab => "关闭标签页",
+            Self::ReopenTab => "恢复关闭的标签页",
+            Self::BrowserHome => "浏览器主页",
+            Self::Escape => "取消操作",
+            Self::Delete => "删除",
+            Self::Keys(_) => "自定义快捷键",
             Self::Unassigned => "未绑定",
             Self::Back => "后退",
             Self::Forward => "前进",
@@ -284,6 +376,9 @@ impl Stroke {
                 };
             }
         }
+    }
+    pub fn long_enough(&self) -> bool {
+        self.far >= 24.
     }
     pub fn is_click(&self) -> bool {
         self.far < 8.0
