@@ -9,7 +9,7 @@ use windows_sys::Win32::Graphics::GdiPlus::*;
 
 pub const REFRESH: u32 = WM_APP + 3;
 pub const TIMER: usize = 1;
-const RESULT_TIME: Duration = Duration::from_millis(550);
+
 const MAX_POINTS: usize = 512;
 
 // The hook only appends physical coordinates. The window thread paints at most one
@@ -21,6 +21,7 @@ struct Trail {
     points: Vec<POINT>,
     visible: bool,
     dirty: bool,
+    idle_deadline: Option<Instant>,
     result: Option<(&'static str, Instant)>,
 }
 static TRAIL: Mutex<Trail> = Mutex::new(Trail {
@@ -29,6 +30,7 @@ static TRAIL: Mutex<Trail> = Mutex::new(Trail {
     points: Vec::new(),
     visible: false,
     dirty: false,
+    idle_deadline: None,
     result: None,
 });
 thread_local! {static POPUP:Cell<HWND>=const{Cell::new(null_mut())};}
@@ -47,6 +49,7 @@ pub fn begin(window: HWND, target: HWND, origin: POINT, dpi: u32) {
     state.visible = false;
     state.dirty = true;
     state.result = None;
+    state.idle_deadline = None;
     drop(state);
     if previous {
         notify(window);
@@ -70,6 +73,17 @@ pub fn extend(window: HWND, pt: POINT) {
     if state.target == 0 {
         return;
     }
+    let now = Instant::now();
+    if state.idle_deadline.is_some_and(|t| now >= t)
+        || state
+            .points
+            .last()
+            .is_some_and(|p| p.x == pt.x && p.y == pt.y)
+    {
+        return;
+    }
+    let timeout = settings::preferences().idle_ms;
+    state.idle_deadline = (timeout > 0).then(|| now + Duration::from_millis(timeout.into()));
     let first = !state.visible;
     append(&mut state.points, pt);
     state.visible = true;
@@ -84,12 +98,21 @@ pub fn finish(window: HWND, pt: POINT, direction: Option<Direction>) {
     if state.target == 0 {
         return;
     }
+    let now = Instant::now();
+    let result_ms = settings::preferences().result_ms;
+    if result_ms == 0 || state.idle_deadline.is_some_and(|t| now >= t) {
+        *state = Trail::default();
+        drop(state);
+        notify(window);
+        return;
+    }
+    state.idle_deadline = None;
     append(&mut state.points, pt);
     state.visible = true;
     state.dirty = true;
     state.result = Some((
         direction.map_or("未识别", |d| d.labels().1),
-        Instant::now() + RESULT_TIME,
+        now + Duration::from_millis(result_ms.into()),
     ));
     drop(state);
     notify(window);
@@ -162,6 +185,7 @@ pub unsafe fn refresh(window: HWND) {
         let mut state = TRAIL.lock().unwrap();
         if !state.visible
             || state.target != GetForegroundWindow() as usize
+            || state.idle_deadline.is_some_and(|t| Instant::now() >= t)
             || state.result.is_some_and(|(_, t)| Instant::now() >= t)
         {
             if state.visible {

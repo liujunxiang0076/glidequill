@@ -6,6 +6,7 @@ mod engine;
 mod input;
 mod overlay;
 mod settings;
+mod startup;
 mod ui;
 use glidequill::DIRECTIONS;
 use std::{
@@ -25,10 +26,18 @@ const RESULT: i32 = 122;
 const OPEN: i32 = 123;
 const EXIT: i32 = 124;
 const THEME: i32 = 127;
+const PAGE: i32 = 130;
+const AUTOSTART: i32 = 131;
+const IDLE: i32 = 132;
+const LINGER: i32 = 133;
+const IDLE_OPTION: i32 = 200;
+const RESULT_OPTION: i32 = 210;
 const CLASS: &str = "GlideQuill.Rules.0.1";
 thread_local! {
     static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
     static CONFIG_READABLE:Cell<bool>=const{Cell::new(true)};
+    static SETTINGS_PAGE:Cell<bool>=const{Cell::new(false)};
+    static STARTUP_ON:Cell<bool>=const{Cell::new(false)};
     static DARK:Cell<bool>=const{Cell::new(false)};
     static WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static LISTENER:RefCell<Option<engine::Listener>>=const{RefCell::new(None)};
@@ -74,25 +83,145 @@ unsafe fn control(class: &str, s: &str, id: i32, style: u32, area: [i32; 4]) -> 
         hwnd
     }
 }
-fn toggle() {
+fn time_label(id: i32, ms: u32) -> &'static str {
+    match ms {
+        0 if id == IDLE => "不取消",
+        0 => "立即消失",
+        250 => "0.25 秒",
+        500 => "0.5 秒",
+        550 => "0.55 秒",
+        1000 => "1 秒",
+        2000 => "2 秒",
+        3000 => "3 秒",
+        _ => unreachable!(),
+    }
+}
+fn update_timing_labels() {
+    let prefs = settings::preferences();
+    label(
+        IDLE,
+        &format!("停笔后取消手势 · {}", time_label(IDLE, prefs.idle_ms)),
+    );
+    label(
+        LINGER,
+        &format!("松键后保留时间 · {}", time_label(LINGER, prefs.result_ms)),
+    );
+}
+fn set_enabled(enabled: bool, persist: bool) {
     if !CONFIG_READABLE.with(Cell::get) {
         return;
     }
-    let active = LISTENER.with(|v| v.borrow_mut().take());
-    if let Some(listener) = active {
-        drop(listener);
+    let listener = if enabled {
+        match engine::Listener::start(app_window(), TEST_INSTANCE.with(Cell::get)) {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                label(RESULT, &format!("无法启动手势监听：{e}"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if !enabled {
+        LISTENER.with(|v| drop(v.borrow_mut().take()));
         overlay::reset();
         label(TOGGLE, "启用全局手势");
-        label(RESULT, "已暂停 · 开启全局手势即可显示划动轨迹");
+    }
+    if persist
+        && let Err(e) = settings::save(settings::Preferences {
+            enabled,
+            ..settings::preferences()
+        })
+    {
+        label(RESULT, &format!("已暂停，启停状态保存失败：{e}"));
+        return;
+    }
+    LISTENER.with(|v| *v.borrow_mut() = listener);
+    label(
+        TOGGLE,
+        if enabled {
+            "暂停全局手势"
+        } else {
+            "启用全局手势"
+        },
+    );
+    label(
+        RESULT,
+        if enabled {
+            "已启用 · 按住 Shift 可临时使用原生右键"
+        } else {
+            "已暂停 · 开启全局手势即可显示划动轨迹"
+        },
+    );
+}
+fn toggle() {
+    set_enabled(LISTENER.with(|v| v.borrow().is_none()), true);
+}
+fn apply_theme(w: HWND, dark: bool) {
+    DARK.with(|v| v.set(dark));
+    unsafe {
+        use windows_sys::Win32::Graphics::Dwm::*;
+        let use_dark = i32::from(dark);
+        DwmSetWindowAttribute(
+            w,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            (&use_dark as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+        label(THEME, if dark { "浅色" } else { "深色" });
+        RedrawWindow(
+            w,
+            null_mut(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+        );
+    }
+}
+fn refresh_startup() -> std::io::Result<bool> {
+    let on = startup::registered()?;
+    STARTUP_ON.with(|v| v.set(on));
+    label(
+        AUTOSTART,
+        if on {
+            "关闭登录自启"
+        } else {
+            "启用登录自启"
+        },
+    );
+    Ok(on)
+}
+fn edit_time(id: i32) {
+    let prefs = settings::preferences();
+    let (choices, base, current) = if id == IDLE {
+        (&settings::IDLE_VALUES, IDLE_OPTION, prefs.idle_ms)
     } else {
-        match engine::Listener::start(app_window(), TEST_INSTANCE.with(Cell::get)) {
-            Ok(listener) => {
-                LISTENER.with(|v| *v.borrow_mut() = Some(listener));
-                label(TOGGLE, "暂停全局手势");
-                label(RESULT, "已启用 · 按住 Shift 可临时使用原生右键");
-            }
-            Err(e) => label(RESULT, &format!("无法启动手势监听：{e}")),
+        (&settings::RESULT_VALUES, RESULT_OPTION, prefs.result_ms)
+    };
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
         }
+        for (i, &ms) in choices.iter().enumerate() {
+            AppendMenuW(
+                menu,
+                MF_STRING | if ms == current { MF_CHECKED } else { 0 },
+                (base + i as i32) as usize,
+                wide(time_label(id, ms)).as_ptr(),
+            );
+        }
+        let mut r = RECT::default();
+        GetWindowRect(GetDlgItem(app_window(), id), &mut r);
+        TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_TOPALIGN,
+            r.left,
+            r.bottom,
+            0,
+            app_window(),
+            null_mut(),
+        );
+        DestroyMenu(menu);
     }
 }
 unsafe fn notify(op: u32) -> bool {
@@ -118,12 +247,21 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 WINDOW.with(|v| v.set(w));
                 ui::set_dpi(GetDpiForWindow(w));
                 ui::build();
+                ui::layout();
                 if overlay::create().is_err() {
                     return -1;
                 }
                 TASKBAR.with(|id| id.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
                 TRAY_OK.with(|ok| ok.set(notify(NIM_ADD)));
                 0
+            }
+            WM_ACTIVATE
+                if (wp & 0xffff) != WA_INACTIVE as usize && SETTINGS_PAGE.with(Cell::get) =>
+            {
+                if let Err(e) = refresh_startup() {
+                    label(RESULT, &format!("无法读取自启设置：{e}"));
+                }
+                DefWindowProcW(w, m, wp, lp)
             }
             WM_PAINT => {
                 ui::paint(w);
@@ -162,26 +300,67 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
                 match id {
-                    THEME => {
-                        let dark = DARK.with(|d| {
-                            d.set(!d.get());
-                            d.get()
+                    PAGE => {
+                        let show = SETTINGS_PAGE.with(|v| {
+                            v.set(!v.get());
+                            v.get()
                         });
-                        use windows_sys::Win32::Graphics::Dwm::*;
-                        let use_dark = i32::from(dark);
-                        DwmSetWindowAttribute(
-                            w,
-                            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-                            (&use_dark as *const i32).cast(),
-                            size_of::<i32>() as u32,
+                        label(
+                            PAGE,
+                            if show {
+                                "返回手势规则"
+                            } else {
+                                "基础设置"
+                            },
                         );
-                        label(THEME, if dark { "浅色" } else { "深色" });
-                        RedrawWindow(
-                            w,
-                            null_mut(),
-                            null_mut(),
-                            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
-                        );
+                        if show && let Err(e) = refresh_startup() {
+                            label(RESULT, &format!("无法读取自启设置：{e}"));
+                        }
+                        ui::layout();
+                    }
+                    AUTOSTART => {
+                        match refresh_startup()
+                            .and_then(|on| startup::set(!on))
+                            .and_then(|()| refresh_startup())
+                        {
+                            Ok(on) => label(
+                                RESULT,
+                                if on {
+                                    "已开启登录自启"
+                                } else {
+                                    "已关闭登录自启"
+                                },
+                            ),
+                            Err(e) => label(RESULT, &format!("自启设置失败：{e}")),
+                        }
+                    }
+                    THEME if CONFIG_READABLE.with(Cell::get) => {
+                        let prefs = settings::preferences();
+                        let dark = !prefs.dark;
+                        match settings::save(settings::Preferences { dark, ..prefs }) {
+                            Ok(()) => apply_theme(w, dark),
+                            Err(e) => label(RESULT, &format!("外观保存失败：{e}")),
+                        }
+                    }
+                    IDLE | LINGER if CONFIG_READABLE.with(Cell::get) => edit_time(id),
+                    id if CONFIG_READABLE.with(Cell::get)
+                        && ((IDLE_OPTION..IDLE_OPTION + 5).contains(&id)
+                            || (RESULT_OPTION..RESULT_OPTION + 5).contains(&id)) =>
+                    {
+                        let mut prefs = settings::preferences();
+                        if id >= RESULT_OPTION {
+                            prefs.result_ms =
+                                settings::RESULT_VALUES[(id - RESULT_OPTION) as usize];
+                        } else {
+                            prefs.idle_ms = settings::IDLE_VALUES[(id - IDLE_OPTION) as usize];
+                        }
+                        match settings::save(prefs) {
+                            Ok(()) => {
+                                update_timing_labels();
+                                label(RESULT, "轨迹时间已保存");
+                            }
+                            Err(e) => label(RESULT, &format!("设置保存失败：{e}")),
+                        }
                     }
                     TOGGLE => toggle(),
                     OPEN => {
@@ -262,10 +441,14 @@ unsafe fn frame_size(dpi: u32) -> RECT {
 fn main() {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let background = std::env::args_os().skip(1).any(|a| a == "--startup");
         let test_id = std::env::var("GLIDEQUILL_UI_TEST_ID")
             .ok()
             .filter(|id| id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         TEST_INSTANCE.with(|v| v.set(test_id.is_some()));
+        if let Some(id) = &test_id {
+            startup::isolate_test(id);
+        }
         let suffix = test_id.map(|id| format!(".test.{id}")).unwrap_or_default();
         let class = wide(&format!("{CLASS}{suffix}"));
         // Keep the handle live for the message loop, including startup and shutdown.
@@ -281,6 +464,9 @@ fn main() {
         let exists = GetLastError() == ERROR_ALREADY_EXISTS;
         let _instance = OwnedHandle::from_raw_handle(mutex);
         if exists {
+            if background {
+                return;
+            }
             for _ in 0..40 {
                 let h = FindWindowW(class.as_ptr(), null_mut());
                 if !h.is_null() {
@@ -294,9 +480,7 @@ fn main() {
         let cfg = settings::load();
         let error = cfg.as_ref().err().map(ToString::to_string);
         CONFIG_READABLE.with(|v| v.set(error.is_none()));
-        if let Ok(c) = cfg {
-            settings::initialize(c)
-        }
+
         let _graphics = ui::GraphicsSession::start();
         let inst = GetModuleHandleW(null_mut());
         let image = include_bytes!("quill.png");
@@ -354,14 +538,27 @@ fn main() {
                 SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE,
             );
         }
-        if let Some(e) = error {
+        update_timing_labels();
+        let prefs = settings::preferences();
+        apply_theme(hwnd, prefs.dark);
+        if let Some(ref e) = error {
             label(RESULT, &format!("配置读取失败，已暂停：{e}"));
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
-                GetDlgItem(hwnd, TOGGLE),
-                0,
-            );
+            for id in [TOGGLE, IDLE, LINGER, THEME] {
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                    GetDlgItem(hwnd, id),
+                    0,
+                );
+            }
+        } else if prefs.enabled {
+            set_enabled(true, false);
         }
-        ShowWindow(hwnd, SW_SHOW);
+        if !background
+            || error.is_some()
+            || !TRAY_OK.with(Cell::get)
+            || (prefs.enabled && LISTENER.with(|v| v.borrow().is_none()))
+        {
+            ShowWindow(hwnd, SW_SHOW);
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             if IsDialogMessageW(hwnd, &msg) == 0 {

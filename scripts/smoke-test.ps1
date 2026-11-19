@@ -8,6 +8,7 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class GestureSmoke {
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string cls,string caption);
     [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
     [DllImport("user32.dll")] public static extern bool AreDpiAwarenessContextsEqual(IntPtr a,IntPtr b);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
@@ -63,7 +64,9 @@ function Require($condition,$message) { if (!$condition) { throw $message } }
 $root = Join-Path ([IO.Path]::GetTempPath()) ('glidequill-test-' + [guid]::NewGuid())
 $start = [Diagnostics.ProcessStartInfo]::new($exe)
 $start.UseShellExecute = $false
-$start.EnvironmentVariables['GLIDEQUILL_UI_TEST_ID'] = [guid]::NewGuid().ToString()
+$testId = [guid]::NewGuid().ToString()
+$start.EnvironmentVariables['GLIDEQUILL_UI_TEST_ID'] = $testId
+$testKey = "HKCU:\Software\GlideQuill\Tests\$testId"
 $start.EnvironmentVariables['LOCALAPPDATA'] = $root
 function Start-TestApp {
     $p = [Diagnostics.Process]::Start($start)
@@ -93,6 +96,17 @@ try {
     }
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
     Save-Screenshot $w 'windows-light.png'
+    [void](Send $w 0x111 130)
+    Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'No settings page'
+    Require ((Get-Label $w 131) -eq '启用登录自启') 'Autostart should default off'
+    Save-Screenshot $w 'windows-settings.png'
+    [void](Send $w 0x111 131)
+    Require ((Get-ItemPropertyValue -LiteralPath $testKey -Name GlideQuill) -ceq ('"'+$exe+'" --startup')) 'Bad logon command'
+    [void](Send $w 0x111 203)
+    [void](Send $w 0x111 211)
+    Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting not applied'
+    Require ((Get-Label $w 133) -like '*0.25 秒') 'Result setting not applied'
+    [void](Send $w 0x111 130)
     # The isolated instance installs the real hook but always forwards mouse events.
     foreach ($round in 1..3) {
         [void](Send $w 0x111 121)
@@ -115,9 +129,36 @@ try {
     [void](Send $w 0x111 124)
     Require ($p.WaitForExit(5000)) 'Tray exit failed'
     Require ((Get-Content -Raw -LiteralPath $legacyFile) -ceq $legacy) 'Legacy rules changed'
-    Write-Output 'PASS: four read-only rules, preview switch, theme, tray, single-instance and legacy config preservation.'
+    $start.Arguments='--startup'
+    $p=[Diagnostics.Process]::Start($start)
+    $deadline=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","GlideQuill · 手势规则")
+        if ($w -ne 0 -and (Get-Label $w 121) -eq '暂停全局手势') {break}
+        Start-Sleep -Milliseconds 40
+    } while (!$p.HasExited -and $deadline.ElapsedMilliseconds -lt 5000)
+    Require ($w -ne 0 -and (Get-Label $w 121) -eq '暂停全局手势') 'Enabled state not restored'
+    Require (![GestureSmoke]::IsWindowVisible($w)) 'Logon launched a visible window'
+    [void](Send $w 0x111 123)
+    [void](Send $w 0x111 130)
+    Require ((Get-Label $w 127) -eq '浅色') 'Theme was not restored'
+    Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting was not restored'
+    Require ((Get-Label $w 133) -like '*0.25 秒') 'Result setting was not restored'
+    Require ((Get-Label $w 131) -eq '关闭登录自启') 'Autostart registration not detected'
+    [void](Send $w 0x111 131)
+    Require ((Get-Item -LiteralPath $testKey).GetValueNames() -notcontains 'GlideQuill') 'Logon entry was not removed'
+    [void](Send $w 0x111 121)
+    [void](Send $w 0x111 124)
+    Require ($p.WaitForExit(5000)) 'Background instance exit failed'
+    $start.Arguments=''
+    $p=Start-TestApp
+    Require ((Get-Label $p.MainWindowHandle 121) -eq '启用全局手势') 'Paused state not restored'
+    [void](Send $p.MainWindowHandle 0x111 124)
+    Require ($p.WaitForExit(5000)) 'Final exit failed'
+    Write-Output 'PASS: persisted settings and pause, isolated logon registration and tray startup, four read-only rules, preview switch, theme, tray, single-instance and legacy config preservation.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
+    if (Test-Path -LiteralPath $testKey) {Remove-Item -LiteralPath $testKey}
     $tempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
     if ((Split-Path $root -Parent) -eq $tempRoot -and (Split-Path $root -Leaf) -like 'glidequill-test-*' -and (Test-Path $root)) {
         Remove-Item -LiteralPath $root -Recurse -Force

@@ -242,7 +242,12 @@ unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u
 fn control_bounds(id: i32) -> [i32; 4] {
     match id {
         THEME => [RIGHT - 89, 12, 89, 30],
+        PAGE => [RIGHT - 197, 12, 100, 30],
+        TOGGLE if SETTINGS_PAGE.with(Cell::get) => [RIGHT - 125, 135, 113, 34],
         TOGGLE => [RIGHT - 113, 67, 113, 34],
+        AUTOSTART => [RIGHT - 125, 193, 113, 34],
+        IDLE => [RIGHT - 150, 251, 132, 34],
+        LINGER => [RIGHT - 150, 309, 132, 34],
         RESULT => [LEFT, 366, RIGHT - LEFT, 30],
         _ => [
             LEFT + 1,
@@ -253,13 +258,19 @@ fn control_bounds(id: i32) -> [i32; 4] {
     }
 }
 fn controls() -> impl Iterator<Item = i32> {
-    [THEME, TOGGLE, RESULT]
+    [THEME, PAGE, TOGGLE, AUTOSTART, IDLE, LINGER, RESULT]
         .into_iter()
         .chain(RULE_ROW..RULE_ROW + 4)
 }
 pub unsafe fn layout() {
     unsafe {
         for id in controls() {
+            let settings = SETTINGS_PAGE.with(Cell::get);
+            let visible = match id {
+                AUTOSTART | IDLE | LINGER => settings,
+                RULE_ROW..=143 => !settings,
+                _ => true,
+            };
             let [x, y, w, h] = control_bounds(id).map(px);
             SetWindowPos(
                 GetDlgItem(app_window(), id),
@@ -268,7 +279,13 @@ pub unsafe fn layout() {
                 y,
                 w,
                 h,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE
+                    | SWP_NOZORDER
+                    | if visible {
+                        SWP_SHOWWINDOW
+                    } else {
+                        SWP_HIDEWINDOW
+                    },
             );
         }
         RedrawWindow(
@@ -281,7 +298,14 @@ pub unsafe fn layout() {
 }
 pub unsafe fn build() {
     unsafe {
-        for (id, name) in [(THEME, "深色"), (TOGGLE, "启用全局手势")] {
+        for (id, name) in [
+            (THEME, "深色"),
+            (PAGE, "基础设置"),
+            (TOGGLE, "启用全局手势"),
+            (AUTOSTART, "启用登录自启"),
+            (IDLE, "停笔取消时间"),
+            (LINGER, "松键后保留时间"),
+        ] {
             control(
                 "BUTTON",
                 name,
@@ -344,6 +368,61 @@ pub unsafe fn paint(w: HWND) {
             p.text,
             0,
         );
+        if SETTINGS_PAGE.with(Cell::get) {
+            text(
+                dc,
+                "基础设置",
+                bounds(LEFT, 63, RIGHT, 103),
+                22,
+                Face::Strong,
+                p.text,
+                0,
+            );
+            text(
+                dc,
+                "更改即时保存。",
+                bounds(LEFT, 99, RIGHT, 122),
+                13,
+                Face::Body,
+                p.muted,
+                0,
+            );
+            panel(dc, bounds(LEFT, 123, RIGHT, 357), p.surface, p.edge, 8);
+            for (i, (name, desc)) in [
+                ("全局手势", "下次启动时恢复当前启停状态"),
+                ("登录 Windows 时自启", "登录后在系统托盘运行"),
+                ("停笔后取消手势", "按住右键停止移动后，清除本次轨迹"),
+                ("松键后保留时间", "控制轨迹和识别结果的显示时长"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let y = 123 + i as i32 * 58;
+                if i > 0 {
+                    fill(dc, bounds(LEFT + 1, y, RIGHT - 1, y + 1), p.edge);
+                }
+                text(
+                    dc,
+                    name,
+                    bounds(LEFT + 16, y + 6, RIGHT - 160, y + 33),
+                    14,
+                    Face::Strong,
+                    p.text,
+                    0,
+                );
+                text(
+                    dc,
+                    desc,
+                    bounds(LEFT + 16, y + 29, RIGHT - 160, y + 53),
+                    12,
+                    Face::Body,
+                    p.muted,
+                    0,
+                );
+            }
+            EndPaint(w, &ps);
+            return;
+        }
         text(
             dc,
             "手势规则",
@@ -440,9 +519,14 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         } else if id == RESULT {
             fill(dc, r, p.base);
             text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);
-        } else if id == TOGGLE {
-            fill(dc, r, p.base);
-            let on = LISTENER.with(|v| v.borrow().is_some());
+        } else if id == TOGGLE || id == AUTOSTART {
+            let settings = SETTINGS_PAGE.with(Cell::get);
+            fill(dc, r, if settings { p.surface } else { p.base });
+            let on = if id == AUTOSTART {
+                STARTUP_ON.with(Cell::get)
+            } else {
+                LISTENER.with(|v| v.borrow().is_some())
+            };
             rounded(
                 dc,
                 bounds(79, 9, 111, 26),
@@ -461,7 +545,13 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             );
             text(
                 dc,
-                "全局手势",
+                if !settings {
+                    "全局手势"
+                } else if on {
+                    "已开启"
+                } else {
+                    "已关闭"
+                },
                 bounds(4, 0, 76, 34),
                 14,
                 Face::Body,
@@ -471,6 +561,45 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                     p.muted
                 },
                 0,
+            );
+        } else if id == IDLE || id == LINGER {
+            fill(dc, r, p.surface);
+            panel(dc, r, p.base, p.edge, 6);
+            let prefs = settings::preferences();
+            let ms = if id == IDLE {
+                prefs.idle_ms
+            } else {
+                prefs.result_ms
+            };
+            text(
+                dc,
+                time_label(id, ms),
+                bounds(10, 0, 108, 34),
+                14,
+                Face::Body,
+                p.text,
+                0,
+            );
+            text(
+                dc,
+                "\u{e70d}",
+                bounds(109, 0, 129, 34),
+                11,
+                Face::Icon,
+                p.muted,
+                DT_CENTER,
+            );
+        } else if id == PAGE {
+            fill(dc, r, p.rail);
+            rounded(dc, r, p.selected, 6);
+            text(
+                dc,
+                &caption(item.hwndItem),
+                r,
+                13,
+                Face::Strong,
+                p.accent,
+                DT_CENTER,
             );
         } else if id == THEME {
             fill(dc, r, p.rail);

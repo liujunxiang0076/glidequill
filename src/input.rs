@@ -270,6 +270,37 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(600));
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
+            // The held stroke expires independently of mouse-up, and cannot revive.
+            let end = POINT { x: 380, y: 240 };
+            assert!(gesture(WM_RBUTTONDOWN, start));
+            gesture(WM_MOUSEMOVE, end);
+            overlay::refresh(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            overlay::refresh(hwnd);
+            assert_eq!(IsWindowVisible(popup), 0);
+            gesture(WM_MOUSEMOVE, POINT { x: 400, y: 240 });
+            assert!(gesture(WM_RBUTTONUP, end));
+            overlay::refresh(hwnd);
+            assert_eq!(IsWindowVisible(popup), 0);
+
+            // With idle cancellation disabled the same pause keeps the trail. Zero
+            // release time must hide it on the first frame after release.
+            let dir =
+                std::env::temp_dir().join(format!("glidequill-timing-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("settings.json"), r#"{"idle_ms":0,"result_ms":0}"#).unwrap();
+            settings::load_from(&dir).unwrap();
+            std::fs::remove_file(dir.join("settings.json")).unwrap();
+            std::fs::remove_dir(dir).unwrap();
+            assert!(gesture(WM_RBUTTONDOWN, start));
+            gesture(WM_MOUSEMOVE, end);
+            overlay::refresh(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            overlay::refresh(hwnd);
+            assert_ne!(IsWindowVisible(popup), 0);
+            assert!(gesture(WM_RBUTTONUP, end));
+            overlay::refresh(hwnd);
+            assert_eq!(IsWindowVisible(popup), 0);
             overlay::destroy();
             DestroyWindow(hwnd);
         }
