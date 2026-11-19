@@ -9,18 +9,60 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 // Layout is in device-independent pixels. Convert once at each drawing/Win32 boundary.
-pub const WIDTH: i32 = 720;
-pub const HEIGHT: i32 = 380;
-const RAIL: i32 = 160;
-const LEFT: i32 = RAIL + 24;
-const RIGHT: i32 = WIDTH - 24;
-const CARD_TOP: i32 = 94;
-const SETTING_HEIGHT: i32 = 68;
-const COLUMN: i32 = (RIGHT - LEFT - 2) / 2;
+pub const WIDTH: i32 = 800;
+pub const HEIGHT: i32 = 438;
+#[derive(Clone, Copy)]
+struct Layout {
+    width: i32,
+    height: i32,
+    rail: i32,
+    left: i32,
+    right: i32,
+    card_top: i32,
+    row_start: i32,
+    row_height: i32,
+    column: i32,
+    setting_height: i32,
+}
+impl Layout {
+    const fn new(width: i32, height: i32) -> Self {
+        let rail = if width < 690 { 56 } else { 148 };
+        let gutter = if width < 740 { 16 } else { 24 };
+        let left = rail + gutter;
+        let right = width - gutter;
+        let card_top = if height < 380 { 76 } else { 88 };
+        let row_start = card_top + 44;
+        let row_height = (height - row_start - 76) / 4;
+        Self {
+            width,
+            height,
+            rail,
+            left,
+            right,
+            card_top,
+            row_start,
+            row_height,
+            column: (right - left - 2) / 2,
+            setting_height: (height - card_top - 72) / 3,
+        }
+    }
+}
+thread_local! {static LAYOUT: Cell<Layout> = const { Cell::new(Layout::new(WIDTH,HEIGHT)) };}
+pub unsafe fn measure(w: HWND) {
+    let mut r = RECT::default();
+    unsafe {
+        GetClientRect(w, &mut r);
+    }
+    let dpi = DPI.with(Cell::get) as i32;
+    LAYOUT.with(|v| {
+        v.set(Layout::new(
+            (r.right * 96 + dpi / 2) / dpi,
+            (r.bottom * 96 + dpi / 2) / dpi,
+        ))
+    });
+}
 pub const PICKER: i32 = 160;
 const COUNT: i32 = GESTURES.len() as i32;
-const ROW_START: i32 = CARD_TOP + 34;
-const ROW_HEIGHT: i32 = 46;
 pub const RULE_ROW: i32 = 140;
 thread_local! { static DPI: Cell<u32> = const { Cell::new(96) }; }
 pub fn set_dpi(dpi: u32) {
@@ -152,6 +194,96 @@ unsafe fn panel(dc: HDC, r: RECT, background: u32, edge: u32, radius: i32) {
         rounded(dc, inset(r, 1), background, radius);
     }
 }
+// A dot marks the start. Rotate the same continuous U or L path into the
+// axes used by the recognizer, including the arrowhead on the outgoing leg.
+unsafe fn draw_turn(dc: HDC, tile: RECT, incoming: (f64, f64), outgoing: (f64, f64), color: u32) {
+    let returning = incoming.0 == -outgoing.0 && incoming.1 == -outgoing.1;
+    let across = if returning {
+        (-incoming.1, incoming.0)
+    } else {
+        outgoing
+    };
+    let scale = (tile.right - tile.left) as f32 / 32.0;
+    let point = |u: f32, v: f32| PointF {
+        X: (tile.left + tile.right) as f32 * 0.5
+            + scale * (u * across.0 as f32 + v * incoming.0 as f32),
+        Y: (tile.top + tile.bottom) as f32 * 0.5
+            + scale * (u * across.1 as f32 + v * incoming.1 as f32),
+    };
+    let knots = if returning {
+        [
+            (-6., -8.),
+            (-6., -4.),
+            (-6., 0.),
+            (-6., 2.),
+            (-6., 11.),
+            (6., 11.),
+            (6., 2.),
+            (6., 0.),
+            (6., -4.),
+            (6., -8.),
+        ]
+    } else {
+        [
+            (-7., -8.),
+            (-7., -6.),
+            (-7., -3.),
+            (-7., 0.),
+            (-7., 5.),
+            (-5., 7.),
+            (0., 7.),
+            (3., 7.),
+            (5., 7.),
+            (9., 7.),
+        ]
+    };
+    let path = knots.map(|(u, v)| point(u, v));
+    let start = path[0];
+    let end = path[path.len() - 1];
+    let dx = outgoing.0 as f32;
+    let dy = outgoing.1 as f32;
+    let head = |side: f32| PointF {
+        X: end.X + scale * (-3.5 * dx - side * dy),
+        Y: end.Y + scale * (-3.5 * dy + side * dx),
+    };
+    unsafe {
+        let mut g = null_mut();
+        let mut pen = null_mut();
+        let mut brush = null_mut();
+        let ink = 0xff00_0000 | rgb(color);
+        if GdipCreateFromHDC(dc, &mut g) == Ok
+            && GdipCreatePen1(ink, 1.6 * scale, UnitPixel, &mut pen) == Ok
+        {
+            GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+            GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
+            GdipSetPenLineJoin(pen, LineJoinRound);
+            GdipDrawBeziers(g, pen, path.as_ptr(), path.len() as i32);
+            let arrow = [head(-2.6), end, head(2.6)];
+            GdipDrawLines(g, pen, arrow.as_ptr(), 3);
+            if GdipCreateSolidFill(ink, &mut brush) == Ok {
+                let radius = 2.0 * scale;
+                GdipFillEllipse(
+                    g,
+                    brush.cast(),
+                    start.X - radius,
+                    start.Y - radius,
+                    2.0 * radius,
+                    2.0 * radius,
+                );
+            }
+        }
+        if !brush.is_null() {
+            GdipDeleteBrush(brush.cast());
+        }
+        if !pen.is_null() {
+            GdipDeletePen(pen);
+        }
+        if !g.is_null() {
+            GdipDeleteGraphics(g);
+        }
+    }
+}
+
 enum Face {
     Body,
     Strong,
@@ -252,30 +384,67 @@ unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u
     }
 }
 fn control_bounds(id: i32) -> [i32; 4] {
+    let l = LAYOUT.with(Cell::get);
     match id {
-        id if id == Page::General as i32 => [10, 16, RAIL - 20, 38],
-        id if id == Page::Rules as i32 => [10, 59, RAIL - 20, 38],
-        id if id == Page::Feedback as i32 => [10, 102, RAIL - 20, 38],
-        TOGGLE if PAGE.with(Cell::get) == Page::General => [RIGHT - 125, CARD_TOP + 17, 113, 34],
-        TOGGLE => [RIGHT - 113, 20, 113, 34],
-        BASIC_TAB => [LEFT + 6, CARD_TOP + 3, 76, 28],
-        SPECIAL_TAB => [LEFT + 85, CARD_TOP + 3, 76, 28],
-        RESET_RULES => [RIGHT - 277, 21, 63, 32],
-        SAVE_RULES => [RIGHT - 208, 21, 86, 32],
-        AUTOSTART => [RIGHT - 125, CARD_TOP + SETTING_HEIGHT + 17, 113, 34],
-        THEME => [RIGHT - 145, CARD_TOP + 2 * SETTING_HEIGHT + 17, 132, 34],
-        IDLE => [RIGHT - 145, CARD_TOP + 17, 132, 34],
-        LINGER => [RIGHT - 145, CARD_TOP + SETTING_HEIGHT + 17, 132, 34],
-        RESULT => [LEFT, HEIGHT - 35, RIGHT - LEFT, 26],
+        id if id == Page::General as i32 => [10, 16, l.rail - 20, 38],
+        id if id == Page::Rules as i32 => [10, 59, l.rail - 20, 38],
+        id if id == Page::Feedback as i32 => [10, 102, l.rail - 20, 38],
+        TOGGLE if PAGE.with(Cell::get) == Page::General => [
+            l.right - 125,
+            l.card_top + (l.setting_height - 34) / 2,
+            113,
+            34,
+        ],
+        TOGGLE => [l.right - 113, 20, 113, 34],
+        BASIC_TAB => [l.left + 10, l.card_top + 7, 80, 30],
+        SPECIAL_TAB => [l.left + 96, l.card_top + 7, 80, 30],
+        RESET_RULES => [l.right - 180, l.height - 48, 68, 32],
+        SAVE_RULES => [l.right - 102, l.height - 48, 102, 32],
+        AUTOSTART => [
+            l.right - 125,
+            l.card_top + l.setting_height + (l.setting_height - 34) / 2,
+            113,
+            34,
+        ],
+        THEME => [
+            l.right - 145,
+            l.card_top + 2 * l.setting_height + (l.setting_height - 34) / 2,
+            132,
+            34,
+        ],
+        IDLE => [
+            l.right - 145,
+            l.card_top + (l.setting_height - 34) / 2,
+            132,
+            34,
+        ],
+        LINGER => [
+            l.right - 145,
+            l.card_top + l.setting_height + (l.setting_height - 34) / 2,
+            132,
+            34,
+        ],
+        RESULT => [
+            l.left,
+            l.height - 48,
+            l.right
+                - l.left
+                - if PAGE.with(Cell::get) == Page::Rules {
+                    188
+                } else {
+                    0
+                },
+            32,
+        ],
         _ => {
             let picker = id >= PICKER;
             let index = (id - if picker { PICKER } else { RULE_ROW }) % BASIC_COUNT as i32;
-            let x = LEFT + 1 + index / 4 * COLUMN;
-            let y = ROW_START + index % 4 * ROW_HEIGHT;
+            let x = l.left + 1 + index / 4 * l.column;
+            let y = l.row_start + index % 4 * l.row_height;
             if picker {
-                [x + 96, y + 8, COLUMN - 109, 330]
+                [x + 112, y + (l.row_height - 30) / 2, l.column - 126, 330]
             } else {
-                [x + 1, y + 1, 94, ROW_HEIGHT - 2]
+                [x + 1, y + 1, 109, l.row_height - 2]
             }
         }
     }
@@ -542,22 +711,26 @@ unsafe extern "system" fn action_field(
 pub unsafe fn paint(w: HWND) {
     unsafe {
         let p = colors();
+        let l = LAYOUT.with(Cell::get);
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(w, &mut ps);
-        fill(dc, bounds(0, 0, WIDTH, HEIGHT), p.base);
-        fill(dc, bounds(0, 0, RAIL, HEIGHT), p.rail);
-        fill(dc, bounds(RAIL - 1, 0, RAIL, HEIGHT), p.edge);
+        fill(dc, bounds(0, 0, l.width, l.height), p.base);
+        fill(dc, bounds(0, 0, l.rail, l.height), p.rail);
+        fill(dc, bounds(l.rail - 1, 0, l.rail, l.height), p.edge);
         let page = PAGE.with(Cell::get);
         text(
             dc,
             page.title(),
-            bounds(LEFT, 14, RIGHT - 120, 55),
+            bounds(l.left, 14, l.right - 120, 55),
             23,
             Face::Strong,
             p.text,
             0,
         );
         let description = match page {
+            Page::Rules if SPECIAL_GROUP.with(Cell::get) => {
+                "按住右键连续划动，顺着弧线回划或转向。"
+            }
             Page::Rules => "选择动作后，点击「保存并重载」应用修改。",
             Page::General => "管理手势启停、登录启动与窗口外观。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
@@ -565,7 +738,7 @@ pub unsafe fn paint(w: HWND) {
         text(
             dc,
             description,
-            bounds(LEFT, 54, RIGHT, 80),
+            bounds(l.left, 54, l.right, 80),
             13,
             Face::Body,
             p.muted,
@@ -574,7 +747,12 @@ pub unsafe fn paint(w: HWND) {
         if page == Page::Rules {
             panel(
                 dc,
-                bounds(LEFT, CARD_TOP, RIGHT, ROW_START + ROW_HEIGHT * 4 + 6),
+                bounds(
+                    l.left,
+                    l.card_top,
+                    l.right,
+                    l.row_start + l.row_height * 4 + 1,
+                ),
                 p.surface,
                 p.edge,
                 8,
@@ -582,23 +760,23 @@ pub unsafe fn paint(w: HWND) {
             text(
                 dc,
                 "对应动作 · 仅预览",
-                bounds(RIGHT - 145, CARD_TOP, RIGHT - 13, ROW_START),
+                bounds(l.right - 145, l.card_top, l.right - 13, l.row_start),
                 12,
                 Face::Body,
                 p.muted,
                 DT_RIGHT,
             );
             for row in 0..4 {
-                let y = ROW_START + row * ROW_HEIGHT;
-                fill(dc, bounds(LEFT + 1, y, RIGHT - 1, y + 1), p.edge);
+                let y = l.row_start + row * l.row_height;
+                fill(dc, bounds(l.left + 1, y, l.right - 1, y + 1), p.edge);
             }
             fill(
                 dc,
                 bounds(
-                    LEFT + 1 + COLUMN,
-                    ROW_START + 1,
-                    LEFT + 2 + COLUMN,
-                    ROW_START + 4 * ROW_HEIGHT,
+                    l.left + 1 + l.column,
+                    l.row_start + 1,
+                    l.left + 2 + l.column,
+                    l.row_start + 4 * l.row_height,
                 ),
                 p.edge,
             );
@@ -617,24 +795,25 @@ pub unsafe fn paint(w: HWND) {
             panel(
                 dc,
                 bounds(
-                    LEFT,
-                    CARD_TOP,
-                    RIGHT,
-                    CARD_TOP + SETTING_HEIGHT * rows.len() as i32,
+                    l.left,
+                    l.card_top,
+                    l.right,
+                    l.card_top + l.setting_height * rows.len() as i32,
                 ),
                 p.surface,
                 p.edge,
                 8,
             );
             for (i, (name, desc)) in rows.iter().enumerate() {
-                let y = CARD_TOP + i as i32 * SETTING_HEIGHT;
+                let y = l.card_top + i as i32 * l.setting_height;
                 if i > 0 {
-                    fill(dc, bounds(LEFT + 16, y, RIGHT - 16, y + 1), p.edge);
+                    fill(dc, bounds(l.left + 16, y, l.right - 16, y + 1), p.edge);
                 }
+                let y = y + (l.setting_height - 64) / 2;
                 text(
                     dc,
                     name,
-                    bounds(LEFT + 16, y + 8, RIGHT - 154, y + 35),
+                    bounds(l.left + 16, y + 8, l.right - 154, y + 35),
                     15,
                     Face::Strong,
                     p.text,
@@ -643,7 +822,7 @@ pub unsafe fn paint(w: HWND) {
                 text(
                     dc,
                     desc,
-                    bounds(LEFT + 16, y + 34, RIGHT - 154, y + 59),
+                    bounds(l.left + 16, y + 34, l.right - 154, y + 59),
                     12,
                     Face::Body,
                     p.muted,
@@ -651,7 +830,11 @@ pub unsafe fn paint(w: HWND) {
                 );
             }
         }
-        fill(dc, bounds(LEFT, HEIGHT - 41, RIGHT, HEIGHT - 40), p.edge);
+        fill(
+            dc,
+            bounds(l.left, l.height - 62, l.right, l.height - 61),
+            p.edge,
+        );
         EndPaint(w, &ps);
     }
 }
@@ -664,25 +847,24 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         if (RULE_ROW..RULE_ROW + COUNT).contains(&id) {
             let dir = GESTURES[(id - RULE_ROW) as usize];
             fill(dc, r, p.surface);
-            let tile = bounds(9, 8, 36, 35);
+            let side = px(32).min(r.bottom - px(4));
+            let top = (r.bottom - side) / 2;
+            let tile = RECT {
+                left: px(10),
+                top,
+                right: px(10) + side,
+                bottom: top + side,
+            };
             rounded(dc, tile, p.selected, 7);
-            text(
-                dc,
-                dir.arrow(),
-                tile,
-                if id - RULE_ROW < BASIC_COUNT as i32 {
-                    17
-                } else {
-                    12
-                },
-                Face::Arrow,
-                p.accent,
-                DT_CENTER,
-            );
+            if let Some((a, b)) = dir.legs() {
+                draw_turn(dc, tile, a, b, p.accent);
+            } else {
+                text(dc, dir.arrow(), tile, 18, Face::Arrow, p.accent, DT_CENTER);
+            }
             text(
                 dc,
                 dir.name(),
-                bounds(42, 0, 94, 44),
+                RECT { left: px(51), ..r },
                 14,
                 Face::Body,
                 p.text,
@@ -855,15 +1037,17 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 color,
                 DT_CENTER,
             );
-            text(
-                dc,
-                page.title(),
-                bounds(41, 0, 139, 38),
-                14,
-                if selected { Face::Strong } else { Face::Body },
-                color,
-                0,
-            );
+            if LAYOUT.with(Cell::get).rail > 56 {
+                text(
+                    dc,
+                    page.title(),
+                    bounds(41, 0, 139, 38),
+                    14,
+                    if selected { Face::Strong } else { Face::Body },
+                    color,
+                    0,
+                );
+            }
         } else if id == THEME {
             fill(dc, r, p.surface);
             panel(dc, r, p.base, p.edge, 6);

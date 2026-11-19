@@ -323,6 +323,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_CREATE => {
                 WINDOW.with(|v| v.set(w));
                 ui::set_dpi(GetDpiForWindow(w));
+                ui::measure(w);
                 ui::build();
                 update_rule_buttons();
                 ui::layout();
@@ -347,11 +348,16 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_ERASEBKGND => 1,
+            WM_SIZE if wp != SIZE_MINIMIZED as usize => {
+                ui::measure(w);
+                ui::layout();
+                0
+            }
             WM_DPICHANGED => {
                 let dpi = (wp & 0xffff) as u32;
                 ui::set_dpi(dpi);
                 let suggested = &*(lp as *const RECT);
-                let frame = frame_size(dpi);
+                let frame = frame_size(dpi, MonitorFromRect(suggested, MONITOR_DEFAULTTONEAREST));
                 SetWindowPos(
                     w,
                     null_mut(),
@@ -536,7 +542,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
 }
 const WINDOW_STYLE: u32 =
     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-unsafe fn frame_size(dpi: u32) -> RECT {
+unsafe fn frame_size(dpi: u32, monitor: HMONITOR) -> RECT {
     let mut frame = RECT {
         left: 0,
         top: 0,
@@ -545,6 +551,20 @@ unsafe fn frame_size(dpi: u32) -> RECT {
     };
     unsafe {
         AdjustWindowRectExForDpi(&mut frame, WINDOW_STYLE, 0, 0, dpi);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            let work = info.rcWork;
+            let margin = (16 * dpi as i32) / 96;
+            frame.right = frame
+                .right
+                .min(frame.left + work.right - work.left - margin);
+            frame.bottom = frame
+                .bottom
+                .min(frame.top + work.bottom - work.top - margin);
+        }
     }
     frame
 }
@@ -563,7 +583,7 @@ unsafe fn launch_bounds() -> RECT {
         if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) < 0 {
             dpi = GetDpiForSystem();
         }
-        let frame = frame_size(dpi);
+        let frame = frame_size(dpi, monitor);
         let (width, height) = (frame.right - frame.left, frame.bottom - frame.top);
         let work = info.rcWork;
         let x = work.left + ((work.right - work.left - width) / 2).max(0);

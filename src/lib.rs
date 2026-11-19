@@ -41,6 +41,12 @@ pub const GESTURES: [Gesture; 16] = [
 ];
 
 impl Gesture {
+    pub fn legs(self) -> Option<((f64, f64), (f64, f64))> {
+        TWO_LEG
+            .iter()
+            .find(|(gesture, _, _)| *gesture == self)
+            .map(|&(_, a, b)| (a, b))
+    }
     pub const fn name(self) -> &'static str {
         match self {
             Self::Left => "向左",
@@ -150,74 +156,128 @@ const TWO_LEG: [(Gesture, Axis, Axis); 8] = [
     (Gesture::DownThenRight, DOWN, RIGHT),
 ];
 #[derive(Default, Clone, Copy)]
+struct Travel {
+    length: f64,
+    abs_x: f64,
+    abs_y: f64,
+}
+impl Travel {
+    fn advance(self, dx: f64, dy: f64, distance: f64) -> Self {
+        Self {
+            length: self.length + distance,
+            abs_x: self.abs_x + dx.abs(),
+            abs_y: self.abs_y + dy.abs(),
+        }
+    }
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            length: self.length - earlier.length,
+            abs_x: self.abs_x - earlier.abs_x,
+            abs_y: self.abs_y - earlier.abs_y,
+        }
+    }
+}
+#[derive(Default, Clone, Copy)]
 struct Pivot {
     position: Axis,
-    length: f64,
-    score: f64,
+    travel: Travel,
+    projection: f64,
 }
 
-fn follows_axis((x, y): Axis, length: f64, (ax, ay): Axis) -> bool {
+fn leg_score((x, y): Axis, travel: Travel, (ax, ay): Axis, minimum: f64) -> Option<f64> {
     let forward = x * ax + y * ay;
-    forward >= 24.0 && forward >= 0.9 * length && (x * ay - y * ax).abs() <= 0.36 * forward
+    let sideways = (x * ay - y * ax).abs();
+    let axial_distance = travel.abs_x * ax.abs() + travel.abs_y * ay.abs();
+    let backtrack = (axial_distance - forward) * 0.5;
+    // Allow a rounded bend and lateral drift, but require sustained travel in order.
+    if forward < minimum
+        || sideways > forward * 0.80
+        || forward < travel.length * 0.69
+        || backtrack > 4.0 + 0.12 * forward
+    {
+        return None;
+    }
+    Some(forward / travel.length)
 }
 
-/// Track distance as well as displacement so loops cannot turn into accidental swipes.
 #[derive(Default)]
 pub struct Stroke {
-    last: (i32, i32),
+    origin: (i32, i32),
     dx: f64,
     dy: f64,
-    length: f64,
+    anchor: Axis,
+    anchored_travel: Travel,
+    travel: Travel,
     far: f64,
     pivots: [Pivot; TWO_LEG.len()],
 }
 impl Stroke {
     pub fn new(x: i32, y: i32) -> Self {
         Self {
-            last: (x, y),
+            origin: (x, y),
             ..Self::default()
         }
     }
     pub fn sample(&mut self, x: i32, y: i32) {
-        let dx = f64::from(x) - f64::from(self.last.0);
-        let dy = f64::from(y) - f64::from(self.last.1);
-        self.dx += dx;
-        self.dy += dy;
-        self.length += dx.hypot(dy);
+        self.dx = f64::from(x) - f64::from(self.origin.0);
+        self.dy = f64::from(y) - f64::from(self.origin.1);
         self.far = self.far.max(self.dx.hypot(self.dy));
-        // Projection onto the incoming axis minus the outgoing axis peaks at the turn.
-        // Keep that point and its path length, independent of stroke duration.
+        let dx = self.dx - self.anchor.0;
+        let dy = self.dy - self.anchor.1;
+        let distance = dx.hypot(dy);
+        self.travel = self.anchored_travel.advance(dx, dy, distance);
+        // Count motion spatially, so dense 1–2 DIP jitter does not inflate path length.
+        // The current endpoint still participates in live preview and on release.
+        if distance >= 4.0 {
+            self.anchor = (self.dx, self.dy);
+            self.anchored_travel = self.travel;
+        }
         for (pivot, (_, a, b)) in self.pivots.iter_mut().zip(TWO_LEG) {
-            let score = self.dx * (a.0 - b.0) + self.dy * (a.1 - b.1);
-            if score > pivot.score {
+            let projection = self.dx * (a.0 - b.0) + self.dy * (a.1 - b.1);
+            if projection > pivot.projection {
                 *pivot = Pivot {
                     position: (self.dx, self.dy),
-                    length: self.length,
-                    score,
+                    travel: self.travel,
+                    projection,
                 };
             }
         }
-        self.last = (x, y);
     }
     pub fn is_click(&self) -> bool {
         self.far < 8.0
     }
     pub fn gesture(&self) -> Option<Gesture> {
+        let mut best = None;
+        let mut best_score = 0.0;
         for (pivot, (gesture, a, b)) in self.pivots.iter().zip(TWO_LEG) {
-            let tail = (self.dx - pivot.position.0, self.dy - pivot.position.1);
-            if follows_axis(pivot.position, pivot.length, a)
-                && follows_axis(tail, self.length - pivot.length, b)
-            {
-                return Some(gesture);
+            let first = pivot.position;
+            let last = (self.dx - first.0, self.dy - first.1);
+            let Some(enter) = leg_score(first, pivot.travel, a, 24.0) else {
+                continue;
+            };
+            let min_exit = (0.18 * (first.0 * a.0 + first.1 * a.1)).clamp(18.0, 32.0);
+            let Some(exit) = leg_score(last, self.travel.since(pivot.travel), b, min_exit) else {
+                continue;
+            };
+            let cosine = (first.0 * last.0 + first.1 * last.1)
+                / (first.0.hypot(first.1) * last.0.hypot(last.1));
+            let is_return = a.0 == -b.0 && a.1 == -b.1;
+            if (is_return && cosine > -0.45) || (!is_return && cosine.abs() > 0.62) {
+                continue;
+            }
+            let score = enter + exit;
+            if score > best_score {
+                best = Some(gesture);
+                best_score = score;
             }
         }
-        self.direction()
+        best.or_else(|| self.direction())
     }
     fn direction(&self) -> Option<Gesture> {
         let x = self.dx.abs();
         let y = self.dy.abs();
         let displacement = x.hypot(y);
-        if displacement < 24. || displacement < 0.78 * self.length {
+        if displacement < 24. || displacement < 0.78 * self.travel.length {
             return None;
         }
         // Equal 45-degree sectors in screen coordinates (+Y is down).
@@ -303,6 +363,82 @@ mod tests {
                 );
             }
             assert_eq!(s.gesture(), Some(expected));
+        }
+    }
+    #[test]
+    fn rounded_continuous_strokes_at_different_sampling_densities() {
+        // Relative coordinates along/across the incoming axis. The hand rolls
+        // through the bend and ends off the first leg, often well short of its start.
+        let returns = [
+            (0, 0),
+            (16, 5),
+            (34, 10),
+            (49, 17),
+            (59, 24),
+            (63, 32),
+            (62, 40),
+            (56, 46),
+            (45, 50),
+            (32, 54),
+            (19, 58),
+        ];
+        let corners = [
+            (0, 0),
+            (15, -3),
+            (30, -9),
+            (48, -14),
+            (61, -14),
+            (69, -8),
+            (74, 2),
+            (77, 15),
+            (81, 30),
+            (84, 45),
+            (85, 61),
+        ];
+        for (gesture, a, b) in TWO_LEG {
+            let reversal = a.0 == -b.0 && a.1 == -b.1;
+            for polarity in if reversal { &[-1., 1.][..] } else { &[1.][..] } {
+                let side = if reversal {
+                    (-a.1 * polarity, a.0 * polarity)
+                } else {
+                    b
+                };
+                for density in [1, 4, 12] {
+                    let mut stroke = Stroke::new(-180, 90);
+                    let points = if reversal { &returns } else { &corners };
+                    for pair in points.windows(2) {
+                        for step in 1..=density {
+                            let f = f64::from(step) / f64::from(density);
+                            let along = f64::from(pair[0].0) + f * f64::from(pair[1].0 - pair[0].0);
+                            let cross = f64::from(pair[0].1) + f * f64::from(pair[1].1 - pair[0].1);
+                            let jitter = if density > 1 { step % 3 - 1 } else { 0 };
+                            stroke.sample(
+                                -180 + (along * a.0 + cross * side.0).round() as i32 + jitter,
+                                90 + (along * a.1 + cross * side.1).round() as i32,
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        stroke.gesture(),
+                        Some(gesture),
+                        "{gesture:?}, density {density}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn broad_loops_and_shallow_diagonal_bends_are_not_special_gestures() {
+        for path in [
+            vec![(0, -60), (60, -60), (60, 0), (0, 0)],
+            vec![(14, -20), (35, -44), (55, -63), (79, -81)],
+            vec![(0, -70), (0, -42), (0, -78), (0, -44)],
+        ] {
+            let mut stroke = Stroke::new(0, 0);
+            for (x, y) in path {
+                stroke.sample(x, y);
+            }
+            assert!(stroke.gesture().is_none_or(|g| g.legs().is_none()));
         }
     }
     #[test]

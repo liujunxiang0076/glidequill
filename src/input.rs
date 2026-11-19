@@ -318,11 +318,41 @@ mod tests {
                 }
                 assert_eq!(GetForegroundWindow(), hwnd);
             }
-            // Turning once replaces the initial straight-direction subtitle.
-            for (end, expected) in [(start, "页面底部"), (POINT { x: 380, y: 140 }, "复制")] {
+            // Continuous rounded U and L strokes, with an offset and shorter return.
+            for (path, expected) in [
+                (
+                    [
+                        (284, 215),
+                        (290, 188),
+                        (300, 160),
+                        (312, 148),
+                        (323, 150),
+                        (331, 166),
+                        (338, 186),
+                        (344, 206),
+                    ],
+                    "页面底部",
+                ),
+                (
+                    [
+                        (278, 211),
+                        (275, 184),
+                        (279, 161),
+                        (287, 148),
+                        (300, 141),
+                        (321, 136),
+                        (345, 131),
+                        (370, 128),
+                    ],
+                    "复制",
+                ),
+            ] {
                 assert!(gesture(WM_RBUTTONDOWN, start));
-                gesture(WM_MOUSEMOVE, POINT { x: 280, y: 140 });
-                gesture(WM_MOUSEMOVE, end);
+                for (x, y) in path {
+                    gesture(WM_MOUSEMOVE, POINT { x, y });
+                }
+                let (x, y) = path[path.len() - 1];
+                let end = POINT { x, y };
                 overlay::refresh(hwnd);
                 assert_ne!(IsWindowVisible(subtitle), 0);
                 let mut buf = [0; 32];
@@ -330,6 +360,9 @@ mod tests {
                 assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), expected);
                 assert!(gesture(WM_RBUTTONUP, end));
                 overlay::refresh(hwnd);
+                assert_ne!(IsWindowVisible(subtitle), 0);
+                let n = GetWindowTextW(subtitle, buf.as_mut_ptr(), 32);
+                assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), expected);
             }
             std::thread::sleep(std::time::Duration::from_millis(600));
             overlay::refresh(hwnd);

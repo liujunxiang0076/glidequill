@@ -15,6 +15,7 @@ public static class GestureSmoke {
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out Bounds r);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr w,IntPtr after,int x,int y,int width,int height,uint flags);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out Bounds r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h,ref Point pt);
     [DllImport("user32.dll")] public static extern bool GetPhysicalCursorPos(out Point pt);
@@ -114,6 +115,26 @@ try {
         Require ([Math]::Abs($frame.Left+$frame.Right-$info.Work.Left-$info.Work.Right) -le 1) 'Window not centered horizontally'
         Require ([Math]::Abs($frame.Top+$frame.Bottom-$info.Work.Top-$info.Work.Bottom) -le 1) 'Window not centered vertically'
     } finally { [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior) }
+    # A compact client area must keep both rule columns and footer actions accessible.
+    $prior=[GestureSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    $scale=[GestureSmoke]::GetDpiForWindow($w)/96.0
+    try {
+        $sw=$frame.Right-$frame.Left
+        $sh=$frame.Bottom-$frame.Top
+        Require ([GestureSmoke]::SetWindowPos($w,[IntPtr]::Zero,0,0,[int](630*$scale),[int](395*$scale),0x16)) 'Compact resize failed'
+        $client=[GestureSmoke+Bounds]::new()
+        [void][GestureSmoke]::GetClientRect($w,[ref]$client)
+        $corner=[GestureSmoke+Point]::new()
+        [void][GestureSmoke]::ClientToScreen($w,[ref]$corner)
+        foreach($id in @(136,137,160,163,164,167)){
+            $bounds=[GestureSmoke+Bounds]::new()
+            [void][GestureSmoke]::GetWindowRect([GestureSmoke]::GetDlgItem($w,$id),[ref]$bounds)
+            Require ($bounds.Left -ge $corner.X -and $bounds.Top -ge $corner.Y -and $bounds.Right -le $corner.X+$client.Right -and $bounds.Bottom -le $corner.Y+$client.Bottom) "Compact layout clipped control $id"
+        }
+    } finally {
+        [void][GestureSmoke]::SetWindowPos($w,[IntPtr]::Zero,0,0,$sw,$sh,0x16)
+        [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior)
+    }
     $names = @('向左','向右','向上','向下','左上','右上','左下','右下')
     $defaults = @(1,2,3,4,6,0,0,0)
     foreach ($i in 0..7) {
