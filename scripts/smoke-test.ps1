@@ -238,10 +238,18 @@ try {
     Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Clean draft enabled Save'
     $before=[IO.File]::ReadAllText($prefsFile)
     $diagonal=[GestureSmoke]::GetDlgItem($w,165)
-    [void](Send $diagonal 0x14f 1)
-    Require ((Send $diagonal 0x157).ToInt32() -ne 0) 'Dropdown did not open'
-    foreach ($step in 1..5) { [void](Send $diagonal 0x100 0x28) }
-    [void](Send $diagonal 0x100 0x0d)
+    # Keep hover selection from racing the keyboard while the list drops under the pointer.
+    $pointer=[GestureSmoke+Point]::new()
+    Require ([GestureSmoke]::GetPhysicalCursorPos([ref]$pointer)) 'Cannot locate mouse pointer'
+    try {
+        Require ([GestureSmoke]::SetPhysicalCursorPos($frame.Left+8,$frame.Top+8)) 'Cannot park pointer outside the dropdown'
+        [void](Send $diagonal 0x14f 1)
+        Require ((Send $diagonal 0x157).ToInt32() -ne 0) 'Dropdown did not open'
+        foreach ($step in 1..5) { [void](Send $diagonal 0x100 0x28) }
+        [void](Send $diagonal 0x100 0x0d)
+    } finally {
+        [void][GestureSmoke]::SetPhysicalCursorPos($pointer.X,$pointer.Y)
+    }
     Require ([GestureSmoke]::IsWindowEnabled($apply)) 'Editing did not enable Save'
     Require ([GestureSmoke]::IsWindowEnabled($reset)) 'Edited defaults cannot be reset'
     Require ([IO.File]::ReadAllText($prefsFile) -ceq $before) 'Selection wrote preferences before Save'

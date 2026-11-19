@@ -16,11 +16,15 @@ use std::{
 use windows_sys::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
 use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::KeyboardAndMouse::*};
 
+struct Target {
+    window: HWND,
+    browser: bool,
+    bindings: settings::Bindings,
+}
 struct Capture {
-    target: HWND,
+    target: Target,
     started: u32,
     cancelled: bool,
-    bindings: [glidequill::Action; glidequill::GESTURES.len()],
     origin: POINT,
     dpi: u32,
     stroke: Stroke,
@@ -43,7 +47,7 @@ pub fn initialize(window: HWND, pass_through: bool) {
     SETTINGS_WINDOW.with(|w| w.set(window));
     PASS_THROUGH.with(|v| v.set(pass_through));
 }
-unsafe fn eligible(point: POINT) -> Option<(HWND, settings::Bindings)> {
+unsafe fn eligible(point: POINT) -> Option<Target> {
     unsafe {
         let target = GetAncestor(WindowFromPoint(point), GA_ROOT);
         if target.is_null() || target != GetForegroundWindow() {
@@ -82,7 +86,12 @@ unsafe fn eligible(point: POINT) -> Option<(HWND, settings::Bindings)> {
         }
         let path = String::from_utf16_lossy(&buf[..n as usize]);
         let exe = path.rsplit('\\').next()?;
-        (!settings::excluded(exe)).then(|| (target, settings::bindings_for(exe)))
+        (!settings::excluded(exe)).then(|| Target {
+            window: target,
+            browser: exe.eq_ignore_ascii_case("msedge.exe")
+                || exe.eq_ignore_ascii_case("chrome.exe"),
+            bindings: settings::bindings_for(exe),
+        })
     }
 }
 unsafe fn is_elevated(proc: HANDLE) -> bool {
@@ -118,7 +127,7 @@ pub unsafe extern "system" fn foreground_changed(
     CAPTURE.with_borrow_mut(|capture| {
         if let Some(s) = capture
             && !s.cancelled
-            && hwnd != s.target
+            && hwnd != s.target.window
             && event_time.wrapping_sub(s.started) as i32 >= 0
         {
             s.cancelled = true;
@@ -225,10 +234,78 @@ unsafe fn close_window(target: HWND) {
     }
 }
 
-// Address the original HWND directly. A slow application must never block the input hook.
-unsafe fn execute(target: HWND, action: Action) {
+fn browser_shortcut(action: Action) -> Option<(Option<u16>, u16)> {
+    match action {
+        Action::Back => Some((Some(VK_MENU), VK_LEFT)),
+        Action::Forward => Some((Some(VK_MENU), VK_RIGHT)),
+        Action::Home => Some((None, VK_HOME)),
+        Action::End => Some((None, VK_END)),
+        Action::Copy => Some((Some(VK_CONTROL), VK_C)),
+        Action::Paste => Some((Some(VK_CONTROL), VK_V)),
+        _ => None,
+    }
+}
+fn key_event(key: u16, flags: u32) -> INPUT {
+    let scan = unsafe { MapVirtualKeyW(key.into(), MAPVK_VK_TO_VSC_EX) };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key,
+                wScan: (scan & 0xff) as u16,
+                dwFlags: flags
+                    | if scan >> 8 == 0xe0 {
+                        KEYEVENTF_EXTENDEDKEY
+                    } else {
+                        0
+                    },
+                ..Default::default()
+            },
+        },
+    }
+}
+// Submit one complete shortcut to the browser's normal accelerator/focus routing.
+unsafe fn send_shortcut(target: HWND, modifier: Option<u16>, key: u16) {
+    unsafe {
+        let pair = [key_event(key, 0), key_event(key, KEYEVENTF_KEYUP)];
+        let chord;
+        let events = if let Some(modifier) = modifier {
+            chord = [
+                key_event(modifier, 0),
+                pair[0],
+                pair[1],
+                key_event(modifier, KEYEVENTF_KEYUP),
+            ];
+            chord.as_slice()
+        } else {
+            pair.as_slice()
+        };
+        if GetAsyncKeyState(key.into()) < 0
+            || modifiers_pressed()
+            || GetForegroundWindow() != target
+        {
+            return;
+        }
+        let size = size_of::<INPUT>() as i32;
+        let sent = SendInput(events.len() as u32, events.as_ptr(), size) as usize;
+        if sent > 0 && sent < events.len() {
+            // Only release keys already pressed by the accepted prefix.
+            if sent == usize::from(modifier.is_some()) + 1 {
+                SendInput(1, &pair[1], size);
+            }
+            if let Some(modifier) = modifier {
+                SendInput(1, &key_event(modifier, KEYEVENTF_KEYUP), size);
+            }
+        }
+    }
+}
+unsafe fn execute(target: HWND, action: Action, browser: bool) {
     unsafe {
         if target != GetForegroundWindow() || modifiers_pressed() {
+            return;
+        }
+        if browser && let Some((modifier, key)) = browser_shortcut(action) {
+            send_shortcut(target, modifier, key);
             return;
         }
         match action {
@@ -287,15 +364,14 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
             WM_RBUTTONDOWN => {
                 if modifiers_pressed() || GetSystemMetrics(SM_SWAPBUTTON) != 0 {
                     false
-                } else if let Some((target, bindings)) = eligible(point) {
-                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(target).max(96);
-                    overlay::begin(SETTINGS_WINDOW.with(Cell::get), target, point, dpi);
+                } else if let Some(target) = eligible(point) {
+                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(target.window).max(96);
+                    overlay::begin(SETTINGS_WINDOW.with(Cell::get), target.window, point, dpi);
                     CAPTURE.with(|c| {
                         *c.borrow_mut() = Some(Capture {
                             target,
                             started: GetTickCount(),
                             cancelled: false,
-                            bindings,
                             origin: point,
                             dpi,
                             stroke: Stroke::new(0, 0),
@@ -313,14 +389,14 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             return;
                         }
                         s.sample(point);
-                        if s.target != GetForegroundWindow() || modifiers_pressed() {
+                        if s.target.window != GetForegroundWindow() || modifiers_pressed() {
                             s.cancelled = true;
                             overlay::cancel(SETTINGS_WINDOW.with(Cell::get));
                         } else if !s.stroke.is_click() {
                             overlay::extend(
                                 SETTINGS_WINDOW.with(Cell::get),
                                 point,
-                                s.stroke.gesture().map(|d| s.bindings[d as usize]),
+                                s.stroke.gesture().map(|d| s.target.bindings[d as usize]),
                             );
                         }
                     }
@@ -331,17 +407,20 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                 if let Some(mut s) = CAPTURE.with(|c| c.borrow_mut().take()) {
                     s.sample(point);
                     let window = SETTINGS_WINDOW.with(Cell::get);
-                    if s.cancelled || s.target != GetForegroundWindow() || modifiers_pressed() {
+                    if s.cancelled
+                        || s.target.window != GetForegroundWindow()
+                        || modifiers_pressed()
+                    {
                         overlay::cancel(window);
                     } else if s.stroke.is_click() {
                         overlay::cancel(window);
-                        if GetAncestor(WindowFromPoint(point), GA_ROOT) == s.target {
+                        if GetAncestor(WindowFromPoint(point), GA_ROOT) == s.target.window {
                             replay_click();
                         }
                     } else {
-                        let action = s.stroke.gesture().map(|d| s.bindings[d as usize]);
+                        let action = s.stroke.gesture().map(|d| s.target.bindings[d as usize]);
                         if let Some(action) = overlay::finish(window, point, action) {
-                            execute(s.target, action);
+                            execute(s.target.window, action, s.target.browser);
                         }
                     }
                     true
@@ -465,14 +544,14 @@ mod tests {
             );
             settings::save_exclusions_in(&test_dir, &[name]).unwrap();
             assert_eq!(
-                eligible(start).map(|(target, _)| target),
+                eligible(start).map(|target| target.window),
                 None,
                 "saved exclusion must bypass the next stroke"
             );
             assert!(!gesture(WM_RBUTTONDOWN, start));
             assert!(!gesture(WM_RBUTTONUP, start));
             settings::save_exclusions_in(&test_dir, &[]).unwrap();
-            assert_eq!(eligible(start).map(|(target, _)| target), Some(hwnd));
+            assert_eq!(eligible(start).map(|target| target.window), Some(hwnd));
             std::fs::remove_file(test_dir.join("excluded.json")).unwrap();
             std::fs::remove_file(test_dir.join("settings.json")).unwrap();
             std::fs::remove_dir(test_dir).unwrap();
@@ -503,7 +582,7 @@ mod tests {
             ] {
                 let end = POINT { x, y };
                 assert_eq!(
-                    eligible(start).map(|(target, _)| target),
+                    eligible(start).map(|target| target.window),
                     Some(hwnd),
                     "hit={:?} foreground={:?}",
                     WindowFromPoint(start),
@@ -734,14 +813,14 @@ mod tests {
                 SWP_SHOWWINDOW,
             );
             assert_eq!(
-                eligible(start).map(|(target, _)| target),
+                eligible(start).map(|target| target.window),
                 None,
                 "fullscreen must be bypassed by default"
             );
             std::fs::write(dir.join("settings.json"), r#"{"pause_fullscreen":false}"#).unwrap();
             settings::load_from(&dir).unwrap();
             assert_eq!(
-                eligible(start).map(|(target, _)| target),
+                eligible(start).map(|target| target.window),
                 Some(hwnd),
                 "fullscreen opt-in must take effect"
             );
@@ -765,7 +844,7 @@ mod tests {
             assert!(!edit.is_null());
             SetFocus(edit);
             for (action, message) in [(Action::Copy, WM_COPY), (Action::Paste, WM_PASTE)] {
-                execute(hwnd, action);
+                execute(hwnd, action, false);
                 assert_eq!(received(edit, message).len(), 1);
                 assert!(received(hwnd, WM_APPCOMMAND).is_empty());
             }
@@ -788,11 +867,11 @@ mod tests {
             SetForegroundWindow(sample);
             let menu = GetSystemMenu(sample, 0);
             EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_GRAYED);
-            execute(sample, Action::Minimize);
+            execute(sample, Action::Minimize, false);
             let mut msg = MSG::default();
             PeekMessageW(&mut msg, sample, 0, 0, PM_NOREMOVE);
             assert_eq!(IsIconic(sample), 0, "explicitly disabled minimize");
-            execute(sample, Action::Close);
+            execute(sample, Action::Close, false);
             let messages = received(sample, WM_SYSCOMMAND);
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].wParam, SC_CLOSE as usize);

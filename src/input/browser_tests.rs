@@ -11,6 +11,42 @@ fn title(window: HWND) -> String {
     let n = unsafe { GetWindowTextW(window, buf.as_mut_ptr(), buf.len() as i32) };
     String::from_utf16_lossy(&buf[..n as usize])
 }
+// Keep the same layered windows visible during dispatch as on the interactive desktop.
+struct FeedbackWindow(HWND);
+impl FeedbackWindow {
+    fn new() -> Self {
+        unsafe {
+            let host = CreateWindowExW(
+                0,
+                crate::wide("STATIC").as_ptr(),
+                null_mut(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            assert!(!host.is_null());
+            crate::WINDOW.set(host);
+            initialize(host, false);
+            overlay::create().unwrap();
+            Self(host)
+        }
+    }
+}
+impl Drop for FeedbackWindow {
+    fn drop(&mut self) {
+        unsafe {
+            overlay::destroy();
+            DestroyWindow(self.0);
+        }
+        crate::WINDOW.set(null_mut());
+    }
+}
 struct Browser {
     child: Child,
     dir: PathBuf,
@@ -39,9 +75,11 @@ function report() {
 }
 onhashchange = onscrollend = report;
 onload = () => requestAnimationFrame(() => requestAnimationFrame(() => { document.querySelector("a").focus(); report(); }));
+let editKey = '';
+onkeydown = e => { if (e.ctrlKey) editKey = e.code; };
 for (const type of ['copy','paste']) document.addEventListener(type, event => {
   event.preventDefault();
-  document.title = 'GlideQuill action test ' + type;
+  document.title = 'GlideQuill action test ' + type + '-' + editKey; editKey = '';
 });
 </script>"##,
         )
@@ -49,6 +87,8 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
         let child = Command::new(chrome)
             .arg(format!("--user-data-dir={}", dir.join("profile").display()))
             .args([
+                "--new-window",
+                "--disable-sync",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-background-mode",
@@ -56,7 +96,7 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
                 "--window-size=740,560",
             ])
             .arg(format!(
-                "--app=file:///{}",
+                "file:///{}",
                 page.display()
                     .to_string()
                     .replace(std::path::MAIN_SEPARATOR, "/")
@@ -95,6 +135,17 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
         }
         panic!("test page {:?} did not become foreground", browser.window);
     }
+    fn activate(&self) {
+        // Restoring a minimized browser completes asynchronously on its UI thread.
+        let start = Instant::now();
+        unsafe {
+            while GetForegroundWindow() != self.window && start.elapsed() < Duration::from_secs(2) {
+                SetForegroundWindow(self.window);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(GetForegroundWindow(), self.window);
+        }
+    }
     fn expect_page(&self, state: &str) {
         let wanted = format!("GlideQuill action test {state}");
         let start = Instant::now();
@@ -107,8 +158,8 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
         panic!("expected {wanted}, observed {}", title(self.window));
     }
     fn swipe(&self, dx: i32, dy: i32) {
+        self.activate();
         unsafe {
-            assert_eq!(GetForegroundWindow(), self.window);
             let mut rect = RECT::default();
             assert_ne!(GetWindowRect(self.window, &mut rect), 0);
             let center = POINT {
@@ -134,7 +185,19 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
                 GetWindowLongW(self.window, GWL_STYLE)
             );
             gesture(WM_MOUSEMOVE, end);
+            overlay::refresh(crate::app_window());
+            assert_ne!(
+                IsWindowVisible(overlay::test_subtitle()),
+                0,
+                "expected a matched action caption"
+            );
+            assert_eq!(
+                GetForegroundWindow(),
+                self.window,
+                "feedback took browser focus"
+            );
             assert!(gesture(WM_RBUTTONUP, end));
+            overlay::refresh(crate::app_window());
         }
     }
 }
@@ -166,6 +229,12 @@ impl Drop for Browser {
 #[ignore = "requires a foreground desktop and an installed Chromium browser"]
 fn external_browser_actions() {
     let _desktop = DESKTOP_TEST.lock().unwrap();
+    unsafe {
+        use windows_sys::Win32::UI::HiDpi::*;
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let _graphics = crate::ui::GraphicsSession::start();
+    let _feedback = FeedbackWindow::new();
     let browser = Browser::start();
     let mut bindings = glidequill::DEFAULT_BINDINGS;
     bindings[glidequill::Gesture::DownLeft as usize] = Action::Minimize;
@@ -201,8 +270,8 @@ fn external_browser_actions() {
             (120, 0, "detail-top"),
             (0, 120, "detail-end"),
             (0, -120, "detail-top"),
-            (-120, -120, "copy"),
-            (120, 120, "paste"),
+            (-120, -120, "copy-KeyC"),
+            (120, 120, "paste-KeyV"),
         ] {
             eprintln!("checking {dx}, {dy} -> {state}");
             browser.swipe(dx, dy);
@@ -228,7 +297,7 @@ fn external_browser_actions() {
                     0
                 );
             }
-            SetForegroundWindow(browser.window);
+            browser.activate();
             let mut normal = RECT::default();
             GetWindowRect(browser.window, &mut normal);
             ShowWindowAsync(browser.window, SW_MAXIMIZE);
@@ -252,7 +321,17 @@ fn external_browser_actions() {
                 );
             }
             let mut restored = RECT::default();
-            GetWindowRect(browser.window, &mut restored);
+            let start = Instant::now();
+            loop {
+                GetWindowRect(browser.window, &mut restored);
+                if (restored.left, restored.top, restored.right, restored.bottom)
+                    == (normal.left, normal.top, normal.right, normal.bottom)
+                    || start.elapsed() >= Duration::from_secs(2)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             assert_eq!(
                 (restored.left, restored.top, restored.right, restored.bottom),
                 (normal.left, normal.top, normal.right, normal.bottom)
@@ -273,7 +352,7 @@ fn external_browser_actions() {
         while IsIconic(browser.window) != 0 && start.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        SetForegroundWindow(browser.window);
+        browser.activate();
         bindings[glidequill::Gesture::DownRight as usize] = Action::Close;
         std::fs::write(
             browser.dir.join("settings.json"),
