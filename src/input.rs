@@ -1,23 +1,48 @@
-use super::*;
+use crate::settings;
+use glidequill::{Action, DIRECTIONS, Stroke};
 use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, RefCell},
+    mem::size_of,
+    ptr::null_mut,
+};
+use windows_sys::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
 use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::KeyboardAndMouse::*};
 
 struct Capture {
     target: HWND,
-    browser: bool,
+    actions: [Action; 4],
     stroke: Stroke,
     last: Instant,
     expired: bool,
 }
 thread_local! {static CAPTURE:RefCell<Option<Capture>>=const{RefCell::new(None)};}
-pub fn cancel() {
-    CAPTURE.with(|c| c.borrow_mut().take());
+pub const DISPATCH: u32 = WM_APP + 1;
+thread_local! {
+    static SETTINGS_WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
+    static PASS_THROUGH:Cell<bool>=const{Cell::new(false)};
+    static PENDING:RefCell<std::collections::VecDeque<(HWND,Action)>>=const{RefCell::new(std::collections::VecDeque::new())};
 }
-
-unsafe fn eligible(point: POINT) -> Option<(HWND, bool)> {
+pub fn initialize(window: HWND, pass_through: bool) {
+    SETTINGS_WINDOW.with(|w| w.set(window));
+    PASS_THROUGH.with(|v| v.set(pass_through));
+}
+pub fn dispatch_pending() {
+    if let Some((target, action)) = PENDING.with(|q| q.borrow_mut().pop_front()) {
+        unsafe {
+            if target == GetForegroundWindow() {
+                perform(target, action)
+            }
+        }
+    }
+}
+unsafe fn eligible(point: POINT) -> Option<(HWND, [Action; 4])> {
     unsafe {
         let target = GetAncestor(WindowFromPoint(point), GA_ROOT);
-        if target.is_null() || target != GetForegroundWindow() || target == app_window() {
+        if target.is_null()
+            || target != GetForegroundWindow()
+            || target == SETTINGS_WINDOW.with(Cell::get)
+        {
             return None;
         }
         let mut mi = MONITORINFO {
@@ -52,13 +77,12 @@ unsafe fn eligible(point: POINT) -> Option<(HWND, bool)> {
         let exe = path.rsplit('\\').next()?;
         let br = glidequill::browser(exe);
         let c = settings::snapshot();
-        let skip = {
-            c.excluded.iter().any(|s| s.eq_ignore_ascii_case(exe))
-                || DIRECTIONS
-                    .iter()
-                    .all(|&d| matches!(c.resolve(br, d), Action::Off | Action::Inherit))
-        };
-        (!skip).then_some((target, br))
+        let actions = DIRECTIONS.map(|d| c.resolve(br, d));
+        let skip = c.excluded.iter().any(|s| s.eq_ignore_ascii_case(exe))
+            || actions
+                .iter()
+                .all(|a| matches!(a, Action::Off | Action::Inherit));
+        (!skip).then_some((target, actions))
     }
 }
 unsafe fn is_elevated(proc: HANDLE) -> bool {
@@ -83,7 +107,7 @@ unsafe fn is_elevated(proc: HANDLE) -> bool {
 }
 pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRESULT {
     unsafe {
-        if code < 0 {
+        if code < 0 || PASS_THROUGH.with(Cell::get) {
             return CallNextHookEx(null_mut(), code, msg, data);
         }
         let e = &*(data as *const MSLLHOOKSTRUCT);
@@ -100,11 +124,11 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
                     || GetSystemMetrics(SM_SWAPBUTTON) != 0
                 {
                     false
-                } else if let Some((target, browser)) = eligible(e.pt) {
+                } else if let Some((target, actions)) = eligible(e.pt) {
                     CAPTURE.with(|c| {
                         *c.borrow_mut() = Some(Capture {
                             target,
-                            browser,
+                            actions,
                             stroke: Stroke::new(e.pt.x, e.pt.y),
                             last: Instant::now(),
                             expired: false,
@@ -137,12 +161,12 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
                             && s.last.elapsed() <= Duration::from_millis(750)
                             && let Some(d) = s.stroke.direction()
                         {
-                            PostMessageW(
-                                app_window(),
-                                RUN,
-                                s.target as usize,
-                                (d as isize) | ((s.browser as isize) << 8),
-                            );
+                            // Defer input injection until the low-level hook returns.
+                            if PostThreadMessageW(GetCurrentThreadId(), DISPATCH, 0, 0) != 0 {
+                                PENDING.with(|q| {
+                                    q.borrow_mut().push_back((s.target, s.actions[d as usize]))
+                                });
+                            }
                         }
                     }
                     true
@@ -173,7 +197,7 @@ unsafe fn replay_click() {
         SendInput(2, batch.as_ptr(), size_of::<INPUT>() as i32);
     }
 }
-pub unsafe fn perform(target: HWND, a: Action) {
+unsafe fn perform(target: HWND, a: Action) {
     unsafe {
         let system_command = match a {
             Action::Minimize => Some(SC_MINIMIZE),

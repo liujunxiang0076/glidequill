@@ -57,6 +57,14 @@ try {
     $w=$p.MainWindowHandle
     Require ((Get-Label $w 121) -eq '启用全局手势') 'Unexpected startup hook state'
     Save-Screenshot $w 'windows-light.png'
+    # The isolated instance installs the real hook but always forwards mouse events.
+    foreach ($round in 1..3) {
+        [void](Send $w 0x111 121)
+        Require ((Get-Label $w 121) -eq '暂停全局手势') 'Listener did not start'
+        [void](Send $w 0x111 121)
+        Require ((Get-Label $w 121) -eq '启用全局手势') 'Listener did not stop'
+    }
+    [void](Send $w 0x111 121)
     $pad=[GestureSmoke]::GetDlgItem($w,125)
     [void](Send $pad 0x204 2 (30*65536+120))
     [void](Send $pad 0x200 2 (30*65536+55))
@@ -73,6 +81,9 @@ try {
     Save-Screenshot $w 'windows-dark.png'
     [void](Send $w 0x10)
     Require (![GestureSmoke]::IsWindowVisible($w)) 'Tray hide failed'
+    Require ((Get-Label $w 121) -eq '暂停全局手势') 'Hiding the window stopped the listener'
+    $p.Refresh()
+    Write-Output ("Hidden-window process snapshot: working set {0:N1} MiB, private bytes {1:N1} MiB." -f ($p.WorkingSet64/1MB),($p.PrivateMemorySize64/1MB))
     $second=[Diagnostics.Process]::Start($start)
     Require ($second.WaitForExit(5000)) 'Duplicate instance'
     Require ([GestureSmoke]::IsWindowVisible($w)) 'Reopen failed'

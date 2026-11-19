@@ -1,25 +1,22 @@
 #![windows_subsystem = "windows"]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 
+mod engine;
 mod input;
 mod settings;
 mod ui;
-use glidequill::{ACTIONS, Action, Config, DIRECTIONS, Stroke};
+use glidequill::{ACTIONS, Action, Config, Stroke};
 use std::{
     cell::{Cell, RefCell},
-    io,
     mem::size_of,
-    path::PathBuf,
     ptr::null_mut,
 };
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    Storage::FileSystem::*,
     System::LibraryLoader::GetModuleHandleW,
     UI::{Shell::*, WindowsAndMessaging::*},
 };
-const RUN: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const SCOPE: i32 = 100;
 const FIRST: i32 = 110;
@@ -37,7 +34,7 @@ thread_local! {
     static DARK:Cell<bool>=const{Cell::new(false)};
     static TRAIL:RefCell<Vec<POINT>>=const{RefCell::new(Vec::new())};
     static WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
-    static HOOK:Cell<HHOOK>=const{Cell::new(null_mut())};
+    static LISTENER:RefCell<Option<engine::Listener>>=const{RefCell::new(None)};
     static GROUP:Cell<bool>=const{Cell::new(false)};
     static PRACTICE:RefCell<Option<Stroke>>=const{RefCell::new(None)};
     static TRAY_OK:Cell<bool>=const{Cell::new(false)};
@@ -120,31 +117,19 @@ fn read_rules(c: &mut Config) {
     }
 }
 fn toggle() {
-    if TEST_INSTANCE.with(Cell::get) {
-        return;
-    }
-    unsafe {
-        let old = HOOK.with(Cell::get);
-        if old.is_null() {
-            let h = SetWindowsHookExW(
-                WH_MOUSE_LL,
-                Some(input::hook),
-                GetModuleHandleW(null_mut()),
-                0,
-            );
-            if h.is_null() {
-                label(RESULT, "无法启动手势监听");
-                return;
+    let active = LISTENER.with(|v| v.borrow_mut().take());
+    if let Some(listener) = active {
+        drop(listener);
+        label(TOGGLE, "启用全局手势");
+        label(RESULT, "已暂停 · 可以继续在窗口内试画");
+    } else {
+        match engine::Listener::start(app_window(), TEST_INSTANCE.with(Cell::get)) {
+            Ok(listener) => {
+                LISTENER.with(|v| *v.borrow_mut() = Some(listener));
+                label(TOGGLE, "暂停全局手势");
+                label(RESULT, "已启用 · Shift + 右键临时放行");
             }
-            HOOK.with(|v| v.set(h));
-            label(TOGGLE, "暂停全局手势");
-            label(RESULT, "已启用 · Shift + 右键临时放行");
-        } else {
-            UnhookWindowsHookEx(old);
-            HOOK.with(|v| v.set(null_mut()));
-            input::cancel();
-            label(TOGGLE, "启用全局手势");
-            label(RESULT, "已暂停 · 可以继续在窗口内试画");
+            Err(e) => label(RESULT, &format!("无法启动手势监听：{e}")),
         }
     }
 }
@@ -338,13 +323,6 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 }
                 0
             }
-            RUN => {
-                if !HOOK.with(Cell::get).is_null() && wp as HWND == GetForegroundWindow() {
-                    let dir = DIRECTIONS[(lp & 3) as usize];
-                    input::perform(wp as HWND, settings::snapshot().resolve(lp & 256 != 0, dir));
-                }
-                0
-            }
             TRAY => {
                 if lp as u32 == WM_LBUTTONDBLCLK {
                     PostMessageW(w, WM_COMMAND, OPEN as usize, 0);
@@ -354,7 +332,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         (OPEN, "打开规则窗口"),
                         (
                             TOGGLE,
-                            if HOOK.with(Cell::get).is_null() {
+                            if LISTENER.with(|v| v.borrow().is_none()) {
                                 "启用手势"
                             } else {
                                 "暂停手势"
@@ -381,9 +359,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_DESTROY => {
-                if !HOOK.with(Cell::get).is_null() {
-                    toggle();
-                }
+                LISTENER.with(|v| drop(v.borrow_mut().take()));
                 notify(NIM_DELETE);
                 PostQuitMessage(0);
                 0
