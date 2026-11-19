@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{OnceLock, RwLock},
+    sync::RwLock,
 };
 
 #[derive(Default, Deserialize)]
@@ -10,7 +10,7 @@ pub struct Config {
     #[serde(default)]
     excluded: Vec<String>,
 }
-static CONFIG: OnceLock<Config> = OnceLock::new();
+static EXCLUDED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 pub const IDLE_VALUES: [u32; 5] = [0, 500, 1000, 2000, 3000];
 pub const RESULT_VALUES: [u32; 5] = [0, 250, 550, 1000, 2000];
@@ -21,6 +21,7 @@ pub struct Preferences {
     #[serde(deserialize_with = "read_bindings")]
     pub bindings: [glidequill::Action; glidequill::GESTURES.len()],
     pub enabled: bool,
+    pub pause_fullscreen: bool,
     pub dark: bool,
     pub idle_ms: u32,
     pub result_ms: u32,
@@ -47,6 +48,7 @@ fn read_bindings<'de, D: serde::Deserializer<'de>>(
 const DEFAULTS: Preferences = Preferences {
     bindings: glidequill::DEFAULT_BINDINGS,
     enabled: false,
+    pause_fullscreen: true,
     dark: false,
     idle_ms: 500,
     result_ms: 550,
@@ -61,9 +63,22 @@ pub fn preferences() -> Preferences {
     *PREFS.read().unwrap()
 }
 pub fn excluded(exe: &str) -> bool {
-    CONFIG
-        .get()
-        .is_some_and(|c| c.excluded.iter().any(|s| s.eq_ignore_ascii_case(exe)))
+    EXCLUDED
+        .read()
+        .unwrap()
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(exe))
+}
+pub fn exclusions() -> Vec<String> {
+    EXCLUDED.read().unwrap().clone()
+}
+pub fn save_exclusions(names: &[String]) -> io::Result<()> {
+    save_exclusions_in(&directory()?, names)
+}
+pub(super) fn save_exclusions_in(dir: &Path, names: &[String]) -> io::Result<()> {
+    write_json(dir, "excluded.json", names)?;
+    *EXCLUDED.write().unwrap() = names.to_vec();
+    Ok(())
 }
 fn directory() -> io::Result<PathBuf> {
     Ok(
@@ -82,7 +97,13 @@ pub fn load() -> io::Result<()> {
     load_from(&directory()?)
 }
 pub(super) fn load_from(dir: &Path) -> io::Result<()> {
-    let exclusions = read::<Config>(&dir.join("rules.json"))?;
+    let exclusions = match fs::read(dir.join("excluded.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            read::<Config>(&dir.join("rules.json"))?.excluded
+        }
+        Err(e) => return Err(e),
+    };
     let prefs = read::<Preferences>(&dir.join("settings.json"))?;
     if !IDLE_VALUES.contains(&prefs.idle_ms) || !RESULT_VALUES.contains(&prefs.result_ms) {
         return Err(io::Error::new(
@@ -90,17 +111,19 @@ pub(super) fn load_from(dir: &Path) -> io::Result<()> {
             "轨迹时间不在支持范围内",
         ));
     }
-    let _ = CONFIG.set(exclusions);
+    *EXCLUDED.write().unwrap() = exclusions;
     *PREFS.write().unwrap() = prefs;
     Ok(())
 }
 // All writes originate on the settings window's thread; readers never wait for disk I/O.
+fn write_json<T: Serialize + ?Sized>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let temp = dir.join(format!("{name}.tmp"));
+    fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(temp, dir.join(name))
+}
 pub fn save(prefs: Preferences) -> io::Result<()> {
-    let dir = directory()?;
-    fs::create_dir_all(&dir)?;
-    let temp = dir.join("settings.json.tmp");
-    fs::write(&temp, serde_json::to_vec_pretty(&prefs)?)?;
-    fs::rename(temp, dir.join("settings.json"))?;
+    write_json(&directory()?, "settings.json", &prefs)?;
     *PREFS.write().unwrap() = prefs;
     Ok(())
 }

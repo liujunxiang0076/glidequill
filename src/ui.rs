@@ -28,6 +28,38 @@ struct Layout {
     roomy: bool,
 }
 impl Layout {
+    fn general_capacity(self) -> i32 {
+        let header = self.group_header();
+        ((self.height - self.card_top - 74 - 3 * header) / 45).clamp(1, 5)
+    }
+    fn group_header(self) -> i32 {
+        if self.roomy { 24 } else { 18 }
+    }
+    fn visible_general(self) -> std::ops::Range<i32> {
+        let capacity = self.general_capacity();
+        let first = GENERAL_FIRST.get().min(5 - capacity);
+        first..(first + capacity)
+    }
+    fn general_row(self, index: i32) -> [i32; 4] {
+        let visible = self.visible_general();
+        let header = self.group_header();
+        let group = |i| match i {
+            0 => 0,
+            1 | 2 => 1,
+            _ => 2,
+        };
+        let height =
+            ((self.height - self.card_top - 74 - header * 3) / visible.len() as i32).clamp(38, 66);
+        let scroll_width = if self.general_capacity() < 5 { 20 } else { 0 };
+        [
+            self.left,
+            self.card_top
+                + header * (group(index) - group(visible.start) + 1)
+                + height * (index - visible.start),
+            self.right - self.left - scroll_width,
+            height,
+        ]
+    }
     const fn new(width: i32, height: i32) -> Self {
         let roomy = width >= 825 && height >= 480;
         let rail = if width < 690 {
@@ -71,6 +103,74 @@ impl Layout {
     }
 }
 thread_local! {static LAYOUT: Cell<Layout> = const { Cell::new(Layout::new(WIDTH,HEIGHT)) };}
+const GENERAL_SCROLL: i32 = 190;
+thread_local! {static GENERAL_FIRST: Cell<i32> = const {Cell::new(0)};}
+const GENERAL_IDS: [i32; 6] = [
+    TOGGLE,
+    FULLSCREEN,
+    EXCLUSIONS,
+    AUTOSTART,
+    THEME_LIGHT,
+    THEME_DARK,
+];
+fn general_index(id: i32) -> Option<i32> {
+    GENERAL_IDS
+        .iter()
+        .position(|&item| item == id)
+        .map(|i| i.min(4) as i32)
+}
+unsafe fn sync_general_scroll() {
+    let l = LAYOUT.get();
+    let first = l.visible_general().start;
+    GENERAL_FIRST.set(first);
+    let info = SCROLLINFO {
+        cbSize: size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+        nMax: 4,
+        nPage: l.general_capacity() as u32,
+        nPos: first,
+        ..Default::default()
+    };
+    unsafe {
+        windows_sys::Win32::UI::Controls::SetScrollInfo(
+            GetDlgItem(app_window(), GENERAL_SCROLL),
+            SB_CTL,
+            &info,
+            1,
+        );
+    }
+}
+pub unsafe fn scroll_general(command: i32, thumb: i32) -> bool {
+    let l = LAYOUT.get();
+    if PAGE.get() != Page::General || l.general_capacity() == 5 {
+        return false;
+    }
+    let first = l.visible_general().start;
+    let next = match command {
+        SB_LINEUP => first - 1,
+        SB_LINEDOWN => first + 1,
+        SB_PAGEUP => first - l.general_capacity(),
+        SB_PAGEDOWN => first + l.general_capacity(),
+        SB_TOP => 0,
+        SB_BOTTOM => 5,
+        SB_THUMBPOSITION | SB_THUMBTRACK => thumb,
+        _ => return false,
+    }
+    .clamp(0, 5 - l.general_capacity());
+    if next != first {
+        GENERAL_FIRST.set(next);
+        unsafe {
+            let w = app_window();
+            for id in GENERAL_IDS {
+                place(id, visible_on(id, Page::General), true);
+            }
+            sync_general_scroll();
+            let dirty = bounds(l.left, l.card_top, l.right, l.height - 60);
+            RedrawWindow(w, &dirty, null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+    }
+    true
+}
 pub unsafe fn measure(w: HWND) {
     let mut r = RECT::default();
     unsafe {
@@ -456,12 +556,44 @@ fn control_bounds(id: i32) -> [i32; 4] {
         return [10, top + index as i32 * (height + gap), l.rail - 20, height];
     }
     match id {
-        TOGGLE if PAGE.with(Cell::get) == Page::General => [
-            l.right - 125,
-            l.card_top + (l.setting_height - 34) / 2,
-            113,
-            34,
+        TOGGLE if PAGE.get() == Page::General => l.general_row(0),
+        GENERAL_SCROLL => [
+            l.right - 14,
+            l.card_top,
+            14,
+            (l.height - l.card_top - 74).max(20),
         ],
+        FULLSCREEN => l.general_row(1),
+        EXCLUSIONS => l.general_row(2),
+        AUTOSTART => l.general_row(3),
+        THEME_LIGHT | THEME_DARK => {
+            let [x, y, width, h] = l.general_row(4);
+            let end = x + width - 12;
+            [
+                end - if id == THEME_LIGHT { 120 } else { 60 },
+                y + (h - 28) / 2,
+                60,
+                28,
+            ]
+        }
+        ADD_APP => [l.left, l.card_top, 100, 32],
+        REMOVE_APP => [l.left + 110, l.card_top, 76, 32],
+        BACK => [l.right - 115, 20, 115, 32],
+        APP_LIST => [
+            l.left,
+            l.card_top + 44,
+            l.right - l.left,
+            (l.height - l.card_top - 116).max(36),
+        ],
+        SAVE_APPS => [l.right - 100, l.height - 51, 100, 34],
+        DIRTY_RULES => {
+            let (y, h, space) = if l.roomy {
+                (l.height - 58, 36, 212)
+            } else {
+                (l.height - 48, 32, 186)
+            };
+            [l.right - space - 94, y, 94, h]
+        }
         TOGGLE => [l.right - 113, 20, 113, 34],
         BASIC_TAB if l.roomy => [l.left + 14, l.card_top + 9, 88, 36],
         SPECIAL_TAB if l.roomy => [l.left + 108, l.card_top + 9, 88, 36],
@@ -471,18 +603,6 @@ fn control_bounds(id: i32) -> [i32; 4] {
         SAVE_RULES if l.roomy => [l.right - 116, l.height - 58, 116, 36],
         RESET_RULES => [l.right - 180, l.height - 48, 68, 32],
         SAVE_RULES => [l.right - 102, l.height - 48, 102, 32],
-        AUTOSTART => [
-            l.right - 125,
-            l.card_top + l.setting_height + (l.setting_height - 34) / 2,
-            113,
-            34,
-        ],
-        THEME => [
-            l.right - 145,
-            l.card_top + 2 * l.setting_height + (l.setting_height - 34) / 2,
-            132,
-            34,
-        ],
         IDLE => [
             l.right - 145,
             l.card_top + (l.setting_height - 34) / 2,
@@ -505,7 +625,9 @@ fn control_bounds(id: i32) -> [i32; 4] {
             l.right
                 - l.left
                 - if PAGE.with(Cell::get) == Page::Rules {
-                    if l.roomy { 216 } else { 188 }
+                    if l.roomy { 312 } else { 284 }
+                } else if PAGE.get() == Page::Exclusions {
+                    108
                 } else {
                     0
                 },
@@ -536,7 +658,17 @@ fn control_bounds(id: i32) -> [i32; 4] {
 }
 fn controls() -> impl Iterator<Item = i32> {
     [
-        THEME,
+        THEME_DARK,
+        THEME_LIGHT,
+        FULLSCREEN,
+        EXCLUSIONS,
+        ADD_APP,
+        REMOVE_APP,
+        SAVE_APPS,
+        BACK,
+        APP_LIST,
+        DIRTY_RULES,
+        GENERAL_SCROLL,
         TOGGLE,
         AUTOSTART,
         IDLE,
@@ -553,10 +685,18 @@ fn controls() -> impl Iterator<Item = i32> {
     .chain(PICKER..PICKER + COUNT)
 }
 fn visible_on(id: i32, page: Page) -> bool {
+    if page == Page::General
+        && let Some(index) = general_index(id)
+    {
+        return LAYOUT.get().visible_general().contains(&index);
+    }
     match id {
-        THEME | AUTOSTART => page == Page::General,
+        GENERAL_SCROLL => page == Page::General && LAYOUT.get().general_capacity() < 5,
+        THEME_LIGHT | THEME_DARK | FULLSCREEN | EXCLUSIONS | AUTOSTART => false,
         IDLE | LINGER => page == Page::Feedback,
-        TOGGLE => page != Page::Feedback,
+        ADD_APP | REMOVE_APP | SAVE_APPS | BACK | APP_LIST => page == Page::Exclusions,
+        DIRTY_RULES => page == Page::Rules,
+        TOGGLE => matches!(page, Page::Rules | Page::General),
         RESET_RULES | SAVE_RULES | BASIC_TAB | SPECIAL_TAB => page == Page::Rules,
         id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
             page == Page::Rules && rule_range().contains(&((id - RULE_ROW) as usize))
@@ -596,6 +736,7 @@ unsafe fn place(id: i32, visible: bool, move_control: bool) {
 pub unsafe fn layout() {
     unsafe {
         let page = PAGE.get();
+        sync_general_scroll();
         for id in controls() {
             place(id, visible_on(id, page), true);
             if (PICKER..PICKER + COUNT).contains(&id) {
@@ -635,7 +776,13 @@ pub unsafe fn switch_page(previous: Page, page: Page) {
         let l = LAYOUT.get();
         let content = bounds(l.rail, 0, l.width, l.height);
         RedrawWindow(w, &content, null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
-        for changed in [previous, page] {
+        for changed in [previous, page].map(|p| {
+            if p == Page::Exclusions {
+                Page::General
+            } else {
+                p
+            }
+        }) {
             InvalidateRect(GetDlgItem(w, changed as i32), null_mut(), 0);
         }
     }
@@ -671,14 +818,28 @@ pub unsafe fn switch_group() {
 pub unsafe fn build() {
     unsafe {
         for (id, name) in [
-            (THEME, "深色"),
+            (THEME_LIGHT, "浅色"),
+            (THEME_DARK, "深色"),
+            (
+                FULLSCREEN,
+                if settings::preferences().pause_fullscreen {
+                    "全屏时暂停手势 · 已开启"
+                } else {
+                    "全屏时暂停手势 · 已关闭"
+                },
+            ),
+            (EXCLUSIONS, "排除的应用"),
+            (ADD_APP, "添加应用…"),
+            (REMOVE_APP, "移除"),
+            (SAVE_APPS, "保存"),
+            (BACK, "返回常规设置"),
             (Page::General as i32, Page::General.title()),
             (Page::Rules as i32, Page::Rules.title()),
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
             (BASIC_TAB, "基础方向"),
             (SPECIAL_TAB, "特殊手势"),
-            (RESET_RULES, "重置"),
+            (RESET_RULES, "重置本组"),
             (SAVE_RULES, "保存并重载"),
             (AUTOSTART, "启用登录自启"),
             (IDLE, "停笔取消时间"),
@@ -693,7 +854,38 @@ pub unsafe fn build() {
             );
             SetWindowSubclass(button, Some(interactive_control), 2, id as usize);
         }
+        control(
+            "SCROLLBAR",
+            "滚动常规设置",
+            GENERAL_SCROLL,
+            WS_TABSTOP | SBS_VERT as u32,
+            control_bounds(GENERAL_SCROLL),
+        );
         let static_style = windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
+        label(
+            EXCLUSIONS,
+            &format!("排除的应用 · {} 个应用", settings::exclusions().len()),
+        );
+        control(
+            "LISTBOX",
+            "排除的应用",
+            APP_LIST,
+            WS_TABSTOP
+                | WS_BORDER
+                | WS_VSCROLL
+                | LBS_NOTIFY as u32
+                | LBS_NOINTEGRALHEIGHT as u32
+                | LBS_HASSTRINGS as u32
+                | LBS_OWNERDRAWFIXED as u32,
+            control_bounds(APP_LIST),
+        );
+        control(
+            "STATIC",
+            "",
+            DIRTY_RULES,
+            static_style,
+            control_bounds(DIRTY_RULES),
+        );
         control(
             "STATIC",
             "已暂停 · 开启全局手势即可显示划动轨迹",
@@ -765,10 +957,17 @@ impl Slide {
         self.from + (self.to - self.from) * (1.0 - (1.0 - t) * (1.0 - t))
     }
 }
-thread_local! { static SLIDES: [Cell<Option<Slide>>;2] = const {[Cell::new(None), Cell::new(None)]}; }
+thread_local! { static SLIDES: [Cell<Option<Slide>>;3] = const {[const { Cell::new(None) };3]}; }
+fn slide_slot(id: i32) -> usize {
+    match id {
+        AUTOSTART => 1,
+        FULLSCREEN => 2,
+        _ => 0,
+    }
+}
 fn switch_position(id: i32, on: bool) -> f32 {
     SLIDES
-        .with(|slots| slots[usize::from(id == AUTOSTART)].get())
+        .with(|slots| slots[slide_slot(id)].get())
         .map_or(f32::from(on), Slide::position)
 }
 pub fn animate_switch(id: i32, was: bool, on: bool) {
@@ -796,7 +995,7 @@ pub fn animate_switch(id: i32, was: bool, on: bool) {
             to: f32::from(on),
         };
         if SetTimer(w, SLIDE_TIMER, 16, None) != 0 {
-            SLIDES.with(|slots| slots[usize::from(id == AUTOSTART)].set(Some(slide)));
+            SLIDES.with(|slots| slots[slide_slot(id)].set(Some(slide)));
             InvalidateRect(w, null_mut(), 0);
         }
     }
@@ -805,7 +1004,7 @@ unsafe fn stop_slide(w: HWND, id: i32) {
     unsafe {
         KillTimer(w, SLIDE_TIMER);
     }
-    SLIDES.with(|slots| slots[usize::from(id == AUTOSTART)].set(None));
+    SLIDES.with(|slots| slots[slide_slot(id)].set(None));
 }
 fn adjacent_control(id: i32, key: usize) -> Option<i32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
@@ -859,12 +1058,12 @@ unsafe extern "system" fn interactive_control(
                 if HOT_CONTROL.with(Cell::get) == w {
                     HOT_CONTROL.with(|hot| hot.set(null_mut()));
                 }
-                if matches!(id, TOGGLE | AUTOSTART) {
+                if matches!(id, TOGGLE | AUTOSTART | FULLSCREEN) {
                     stop_slide(w, id);
                 }
             }
-            WM_TIMER if wp == SLIDE_TIMER && matches!(id, TOGGLE | AUTOSTART) => {
-                let slide = SLIDES.with(|slots| slots[usize::from(id == AUTOSTART)].get());
+            WM_TIMER if wp == SLIDE_TIMER && matches!(id, TOGGLE | AUTOSTART | FULLSCREEN) => {
+                let slide = SLIDES.with(|slots| slots[slide_slot(id)].get());
                 if slide.is_none_or(|s| s.start.elapsed().as_secs_f32() >= SLIDE_SECONDS) {
                     stop_slide(w, id);
                 }
@@ -1013,6 +1212,14 @@ unsafe extern "system" fn action_field(
         ret
     }
 }
+pub unsafe fn list_background(dc: HDC) -> HBRUSH {
+    let surface = colors().surface;
+    unsafe {
+        SetBkColor(dc, surface);
+        SetDCBrushColor(dc, surface);
+        GetStockObject(DC_BRUSH)
+    }
+}
 pub unsafe fn paint(w: HWND) {
     unsafe {
         let p = colors();
@@ -1036,10 +1243,11 @@ pub unsafe fn paint(w: HWND) {
         );
         let description = match page {
             Page::Rules if SPECIAL_GROUP.with(Cell::get) => {
-                "按住右键连续划动，顺着弧线回划或转向。"
+                "按住右键连续回划或转向，屏幕下方会显示识别出的动作名称。"
             }
-            Page::Rules => "选择动作后，点击「保存并重载」应用修改。",
-            Page::General => "管理手势启停、登录启动与窗口外观。",
+            Page::Rules => "当前版本会在屏幕下方显示识别出的动作名称。修改绑定后请保存。",
+            Page::General => "管理手势的运行状态、生效范围与窗口外观。",
+            Page::Exclusions => "按程序文件名匹配，同名程序共用一条排除规则。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
         };
         text(
@@ -1066,7 +1274,7 @@ pub unsafe fn paint(w: HWND) {
             );
             text(
                 dc,
-                "对应动作 · 仅预览",
+                "绑定动作",
                 bounds(l.right - 145, l.card_top, l.right - 13, l.row_start),
                 12,
                 Face::Body,
@@ -1087,18 +1295,46 @@ pub unsafe fn paint(w: HWND) {
                 ),
                 p.edge,
             );
-        } else {
-            let rows: &[(&str, &str)] = match page {
-                Page::General => &[
-                    ("全局手势", "下次启动时恢复当前状态"),
-                    ("登录时自启", "登录 Windows 后在系统托盘运行"),
-                    ("窗口外观", "切换浅色与深色主题"),
-                ],
-                _ => &[
-                    ("停笔后取消手势", "按住右键停止移动后，清除本次轨迹"),
-                    ("松键后保留时间", "轨迹和屏幕下方字幕同时消失"),
-                ],
-            };
+        } else if page == Page::General {
+            let visible = l.visible_general();
+            for index in visible.clone() {
+                if index != visible.start && !matches!(index, 1 | 3) {
+                    continue;
+                }
+                let heading = match index {
+                    0 => "手势",
+                    1 | 2 => "生效范围",
+                    _ => "启动与外观",
+                };
+                let [x, y, _, _] = l.general_row(index);
+                text(
+                    dc,
+                    heading,
+                    bounds(x, y - if l.roomy { 24 } else { 18 }, l.right, y),
+                    12,
+                    Face::Strong,
+                    p.muted,
+                    0,
+                );
+            }
+            if visible.contains(&4) {
+                let [x, y, width, h] = l.general_row(4);
+                rounded(dc, bounds(x, y, x + width, y + h - 1), p.surface, 6);
+                text(
+                    dc,
+                    "窗口外观",
+                    bounds(x + 14, y, l.right - 140, y + h),
+                    14,
+                    Face::Strong,
+                    p.text,
+                    0,
+                );
+            }
+        } else if page == Page::Feedback {
+            let rows = [
+                ("按住右键时", "停笔多久后取消本次手势并清除轨迹"),
+                ("松开右键后", "轨迹和屏幕下方的动作名称保留多久"),
+            ];
             panel(
                 dc,
                 bounds(
@@ -1225,18 +1461,29 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 if active { p.accent } else { p.muted },
                 DT_CENTER,
             );
-        } else if id == RESULT {
+        } else if matches!(id, RESULT | DIRTY_RULES) {
             fill(dc, r, p.base);
-            text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);
-        } else if matches!(id, RESET_RULES | SAVE_RULES) {
+            text(
+                dc,
+                &caption(item.hwndItem),
+                r,
+                12,
+                Face::Body,
+                if id == DIRTY_RULES { p.accent } else { p.muted },
+                if id == DIRTY_RULES { DT_RIGHT } else { 0 },
+            );
+        } else if matches!(
+            id,
+            RESET_RULES | SAVE_RULES | ADD_APP | REMOVE_APP | SAVE_APPS | BACK
+        ) {
             let enabled = IsWindowEnabled(item.hwndItem) != 0;
-            let primary = enabled && id == SAVE_RULES;
+            let primary = enabled && matches!(id, SAVE_RULES | SAVE_APPS);
             fill(dc, r, p.base);
             let background = if primary {
                 state.tint(p.accent, p.text)
             } else if enabled {
                 state.tint(p.surface, p.accent)
-            } else if id == SAVE_RULES {
+            } else if matches!(id, SAVE_RULES | SAVE_APPS) {
                 p.edge
             } else {
                 p.base
@@ -1264,38 +1511,136 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 ink,
                 DT_CENTER,
             );
-        } else if id == TOGGLE || id == AUTOSTART {
-            let settings = PAGE.with(Cell::get) == Page::General;
-            fill(dc, r, if settings { p.surface } else { p.base });
-            let on = if id == AUTOSTART {
-                STARTUP_ON.with(Cell::get)
+        } else if matches!(id, TOGGLE | AUTOSTART | FULLSCREEN | EXCLUSIONS) {
+            let general = PAGE.get() == Page::General;
+            let bg = if general {
+                state.tint(p.surface, p.accent)
             } else {
-                LISTENER.with(|v| v.borrow().is_some())
+                p.base
             };
-            let progress = switch_position(id, on);
-            let track = state.tint(mix(p.muted, p.accent, progress), p.text);
-            rounded(dc, bounds(76, 7, 112, 27), track, 10);
-            let x = 78 + (16.0 * progress).round() as i32;
-            rounded(dc, bounds(x, 9, x + 16, 25), p.surface, 8);
-            text(
-                dc,
-                if !settings {
+            fill(dc, r, p.base);
+            if general {
+                rounded(
+                    dc,
+                    RECT {
+                        bottom: r.bottom - 1,
+                        ..r
+                    },
+                    bg,
+                    6,
+                );
+                let (title, hint) = match id {
+                    TOGGLE => ("全局手势", "按住右键划动，按住 Shift 可临时使用原生右键"),
+                    FULLSCREEN => ("全屏时暂停手势", "退出全屏后自动恢复"),
+                    EXCLUSIONS => ("排除的应用", "在指定程序中保留原生右键"),
+                    _ => ("登录时自启", "登录 Windows 后在托盘运行"),
+                };
+                let left = RECT {
+                    left: px(14),
+                    right: r.right - px(132),
+                    ..r
+                };
+                if r.bottom >= px(45) {
+                    let middle = (r.bottom - r.top) / 2 + px(2);
+                    text(
+                        dc,
+                        title,
+                        RECT {
+                            top: middle - px(23),
+                            bottom: middle,
+                            ..left
+                        },
+                        14,
+                        Face::Strong,
+                        p.text,
+                        0,
+                    );
+                    text(
+                        dc,
+                        hint,
+                        RECT {
+                            top: middle,
+                            bottom: middle + px(19),
+                            ..left
+                        },
+                        12,
+                        Face::Body,
+                        p.muted,
+                        0,
+                    );
+                } else {
+                    text(dc, title, left, 14, Face::Strong, p.text, 0);
+                }
+            }
+            if id == EXCLUSIONS {
+                let name = caption(item.hwndItem);
+                text(
+                    dc,
+                    &format!("{}  ›", name.split(" · ").last().unwrap_or("")),
+                    RECT {
+                        right: r.right - px(14),
+                        ..r
+                    },
+                    14,
+                    Face::Body,
+                    p.accent,
+                    DT_RIGHT,
+                );
+            } else {
+                let on = match id {
+                    AUTOSTART => STARTUP_ON.get(),
+                    FULLSCREEN => settings::preferences().pause_fullscreen,
+                    _ => LISTENER.with_borrow(|v| v.is_some()),
+                };
+                let progress = switch_position(id, on);
+                let right = r.right - if general { px(14) } else { px(1) };
+                let top = (r.bottom - px(20)) / 2;
+                let track = RECT {
+                    left: right - px(36),
+                    top,
+                    right,
+                    bottom: top + px(20),
+                };
+                rounded(
+                    dc,
+                    track,
+                    state.tint(mix(p.muted, p.accent, progress), p.text),
+                    10,
+                );
+                let x = track.left + px(2) + (px(16) as f32 * progress).round() as i32;
+                rounded(
+                    dc,
+                    RECT {
+                        left: x,
+                        top: top + px(2),
+                        right: x + px(16),
+                        bottom: top + px(18),
+                    },
+                    p.surface,
+                    8,
+                );
+                let name = if !general {
                     "全局手势"
                 } else if on {
                     "已开启"
+                } else if id == TOGGLE {
+                    "已暂停"
                 } else {
                     "已关闭"
-                },
-                bounds(4, 0, 76, 34),
-                14,
-                Face::Body,
-                if item.itemState & ODS_DISABLED == 0 {
-                    p.text
-                } else {
-                    p.muted
-                },
-                0,
-            );
+                };
+                text(
+                    dc,
+                    name,
+                    RECT {
+                        right: track.left - px(10),
+                        ..r
+                    },
+                    14,
+                    Face::Body,
+                    p.text,
+                    DT_RIGHT,
+                );
+            }
         } else if id == IDLE || id == LINGER {
             fill(dc, r, p.surface);
             panel(
@@ -1330,7 +1675,8 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 DT_CENTER,
             );
         } else if let Some(page) = Page::ALL.into_iter().find(|&page| page as i32 == id) {
-            let selected = PAGE.with(Cell::get) == page;
+            let selected =
+                PAGE.get() == page || (page == Page::General && PAGE.get() == Page::Exclusions);
             fill(dc, r, p.rail);
             let background = if selected {
                 state.tint(p.accent, p.text)
@@ -1340,7 +1686,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             rounded(dc, r, background, 7);
             let color = if selected { p.surface } else { p.text };
             let icon = match page {
-                Page::General => "\u{e713}",
+                Page::General | Page::Exclusions => "\u{e713}",
                 Page::Rules => "\u{e8fd}",
                 Page::Feedback => "\u{e7f4}",
             };
@@ -1368,38 +1714,52 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                     0,
                 );
             }
-        } else if id == THEME {
+        } else if matches!(id, THEME_LIGHT | THEME_DARK) {
+            let active = (id == THEME_DARK) == DARK.get();
             fill(dc, r, p.surface);
             panel(
                 dc,
                 r,
-                state.tint(p.base, p.accent),
-                state.tint(p.edge, p.accent),
-                6,
+                state.tint(if active { p.selected } else { p.surface }, p.accent),
+                if active { p.accent } else { p.edge },
+                5,
             );
-            let icon = if DARK.with(Cell::get) {
-                "\u{e706}"
-            } else {
-                "\u{e708}"
-            };
             text(
                 dc,
-                icon,
-                bounds(7, 0, 29, 34),
-                14,
-                Face::Icon,
-                p.muted,
+                if id == THEME_DARK { "深色" } else { "浅色" },
+                r,
+                13,
+                if active { Face::Strong } else { Face::Body },
+                if active { p.accent } else { p.text },
                 DT_CENTER,
             );
-            text(
-                dc,
-                &format!("切换至{}", caption(item.hwndItem)),
-                bounds(35, 0, 132, 34),
-                13,
-                Face::Body,
-                p.text,
-                0,
-            );
+        } else if id == APP_LIST {
+            let selected = item.itemState & ODS_SELECTED != 0;
+            fill(dc, r, if selected { p.selected } else { p.surface });
+            if item.itemID != u32::MAX {
+                let len = SendMessageW(item.hwndItem, LB_GETTEXTLEN, item.itemID as usize, 0);
+                if len >= 0 {
+                    let mut buf = vec![0u16; len as usize + 1];
+                    SendMessageW(
+                        item.hwndItem,
+                        LB_GETTEXT,
+                        item.itemID as usize,
+                        buf.as_mut_ptr() as isize,
+                    );
+                    text(
+                        dc,
+                        &String::from_utf16_lossy(&buf[..len as usize]),
+                        RECT {
+                            left: r.left + px(12),
+                            ..r
+                        },
+                        14,
+                        Face::Body,
+                        p.text,
+                        0,
+                    );
+                }
+            }
         }
         if item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT) == ODS_FOCUS
             && SendMessageW(item.hwndItem, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0

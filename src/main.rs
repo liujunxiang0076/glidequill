@@ -3,6 +3,7 @@
 use windows_sys::Win32::UI::HiDpi::*;
 
 mod engine;
+mod exclusions;
 mod input;
 mod overlay;
 mod settings;
@@ -25,7 +26,16 @@ const TOGGLE: i32 = 121;
 const RESULT: i32 = 122;
 const OPEN: i32 = 123;
 const EXIT: i32 = 124;
-const THEME: i32 = 127;
+const THEME_DARK: i32 = 127;
+const THEME_LIGHT: i32 = 180;
+const FULLSCREEN: i32 = 181;
+const EXCLUSIONS: i32 = 182;
+const APP_LIST: i32 = 183;
+const ADD_APP: i32 = 184;
+const REMOVE_APP: i32 = 185;
+const SAVE_APPS: i32 = 186;
+const BACK: i32 = 187;
+const DIRTY_RULES: i32 = 188;
 const RESET_RULES: i32 = 136;
 const SAVE_RULES: i32 = 137;
 const BASIC_TAB: i32 = 138;
@@ -43,11 +53,13 @@ enum Page {
     General = 130,
     Rules = 134,
     Feedback = 135,
+    Exclusions = 189,
 }
 impl Page {
     const ALL: [Self; 3] = [Self::General, Self::Rules, Self::Feedback];
     fn title(self) -> &'static str {
         match self {
+            Self::Exclusions => "排除的应用",
             Self::General => "常规设置",
             Self::Rules => "手势规则",
             Self::Feedback => "轨迹与字幕",
@@ -153,21 +165,19 @@ fn set_enabled(enabled: bool, persist: bool) {
     } else {
         None
     };
-    if !enabled {
-        LISTENER.with(|v| drop(v.borrow_mut().take()));
-        overlay::reset();
-        label(TOGGLE, "启用全局手势");
-    }
     if persist
         && let Err(e) = settings::save(settings::Preferences {
             enabled,
             ..settings::preferences()
         })
     {
-        label(RESULT, &format!("已暂停，启停状态保存失败：{e}"));
+        label(RESULT, &format!("启停状态保存失败：{e}"));
         return;
     }
     LISTENER.with(|v| *v.borrow_mut() = listener);
+    if !enabled {
+        overlay::reset();
+    }
     label(
         TOGGLE,
         if enabled {
@@ -205,9 +215,20 @@ fn selected_bindings() -> Option<[Action; GESTURES.len()]> {
 fn update_rule_buttons() {
     let draft = selected_bindings().filter(|_| CONFIG_READABLE.with(Cell::get));
     let saved = settings::preferences().bindings;
+    let count = draft.map_or(0, |b| {
+        b.iter().zip(saved).filter(|(a, b)| **a != *b).count()
+    });
+    label(
+        DIRTY_RULES,
+        &if count == 0 {
+            String::new()
+        } else {
+            format!("有 {count} 项未保存")
+        },
+    );
     unsafe {
         for (id, enabled) in [
-            (SAVE_RULES, draft.is_some_and(|b| b != saved)),
+            (SAVE_RULES, count != 0),
             (
                 RESET_RULES,
                 draft.is_some_and(|b| b[rule_range()] != DEFAULT_BINDINGS[rule_range()]),
@@ -238,6 +259,22 @@ fn save_bindings() {
 }
 fn apply_theme(w: HWND, dark: bool) {
     DARK.with(|v| v.set(dark));
+    label(
+        THEME_DARK,
+        if dark {
+            "深色 · 已选中"
+        } else {
+            "深色"
+        },
+    );
+    label(
+        THEME_LIGHT,
+        if dark {
+            "浅色"
+        } else {
+            "浅色 · 已选中"
+        },
+    );
     unsafe {
         use windows_sys::Win32::Graphics::Dwm::*;
         let use_dark = i32::from(dark);
@@ -247,7 +284,7 @@ fn apply_theme(w: HWND, dark: bool) {
             (&use_dark as *const i32).cast(),
             size_of::<i32>() as u32,
         );
-        label(THEME, if dark { "浅色" } else { "深色" });
+
         RedrawWindow(
             w,
             null_mut(),
@@ -350,6 +387,19 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_ERASEBKGND => 1,
+            WM_VSCROLL if ui::scroll_general((wp & 0xffff) as i32, (wp >> 16) as i32) => 0,
+            WM_MOUSEWHEEL
+                if ui::scroll_general(
+                    if (wp >> 16) as i16 > 0 {
+                        SB_LINEUP
+                    } else {
+                        SB_LINEDOWN
+                    },
+                    0,
+                ) =>
+            {
+                0
+            }
             WM_SIZE if wp != SIZE_MINIMIZED as usize => {
                 ui::measure(w);
                 ui::layout();
@@ -385,16 +435,40 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 item.itemHeight = ui::px(26) as u32;
                 1
             }
+            WM_CTLCOLORLISTBOX if lp as HWND == GetDlgItem(w, APP_LIST) => {
+                ui::list_background(wp as HDC) as isize
+            }
             WM_DRAWITEM => {
                 ui::item(&*(lp as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT));
                 1
             }
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
-                if let Some(page) = Page::ALL.into_iter().find(|&p| p as i32 == id) {
-                    let previous = PAGE.replace(page);
-                    if previous == page {
+                let destination = match id {
+                    EXCLUSIONS if CONFIG_READABLE.get() => Some(Page::Exclusions),
+                    BACK => Some(Page::General),
+                    _ => Page::ALL.into_iter().find(|&p| p as i32 == id),
+                };
+                if let Some(page) = destination {
+                    let previous = PAGE.get();
+                    if previous == page
+                        || (previous == Page::Exclusions && !exclusions::may_leave(w))
+                    {
                         return 0;
+                    }
+                    if page == Page::Exclusions {
+                        exclusions::open();
+                    }
+                    PAGE.set(page);
+                    if previous == Page::Exclusions {
+                        label(
+                            RESULT,
+                            if LISTENER.with_borrow(|v| v.is_some()) {
+                                "手势已开启"
+                            } else {
+                                "手势已暂停"
+                            },
+                        );
                     }
                     if page == Page::General
                         && let Err(e) = refresh_startup()
@@ -402,6 +476,12 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         label(RESULT, &format!("无法读取自启设置：{e}"));
                     }
                     ui::switch_page(previous, page);
+                    if page == Page::Exclusions || id == BACK {
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(GetDlgItem(
+                            w,
+                            if id == BACK { EXCLUSIONS } else { BACK },
+                        ));
+                    }
                     return 0;
                 }
                 match id {
@@ -456,9 +536,42 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             Err(e) => label(RESULT, &format!("自启设置失败：{e}")),
                         }
                     }
-                    THEME if CONFIG_READABLE.with(Cell::get) => {
+                    ADD_APP if PAGE.get() == Page::Exclusions => exclusions::pick(w),
+                    REMOVE_APP if PAGE.get() == Page::Exclusions => exclusions::remove(),
+                    APP_LIST if wp >> 16 == LBN_SELCHANGE as usize => exclusions::update_buttons(),
+                    SAVE_APPS if PAGE.get() == Page::Exclusions => {
+                        exclusions::save();
+                    }
+                    FULLSCREEN if CONFIG_READABLE.get() => {
                         let prefs = settings::preferences();
-                        let dark = !prefs.dark;
+                        match settings::save(settings::Preferences {
+                            pause_fullscreen: !prefs.pause_fullscreen,
+                            ..prefs
+                        }) {
+                            Ok(()) => {
+                                label(
+                                    FULLSCREEN,
+                                    if prefs.pause_fullscreen {
+                                        "全屏时暂停手势 · 已关闭"
+                                    } else {
+                                        "全屏时暂停手势 · 已开启"
+                                    },
+                                );
+                                ui::animate_switch(
+                                    FULLSCREEN,
+                                    prefs.pause_fullscreen,
+                                    !prefs.pause_fullscreen,
+                                );
+                            }
+                            Err(e) => label(RESULT, &format!("全屏设置保存失败：{e}")),
+                        }
+                    }
+                    THEME_DARK | THEME_LIGHT if CONFIG_READABLE.with(Cell::get) => {
+                        let prefs = settings::preferences();
+                        let dark = id == THEME_DARK;
+                        if dark == prefs.dark {
+                            return 0;
+                        }
                         match settings::save(settings::Preferences { dark, ..prefs }) {
                             Ok(()) => apply_theme(w, dark),
                             Err(e) => label(RESULT, &format!("外观保存失败：{e}")),
@@ -501,6 +614,9 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         SetForegroundWindow(w);
                     }
                     EXIT => {
+                        if PAGE.get() == Page::Exclusions && !exclusions::may_leave(w) {
+                            return 0;
+                        }
                         DestroyWindow(w);
                     }
                     _ => {}
@@ -700,10 +816,18 @@ fn main() {
         apply_theme(hwnd, prefs.dark);
         if let Some(ref e) = error {
             label(RESULT, &format!("配置读取失败，已暂停：{e}"));
-            for id in [TOGGLE, IDLE, LINGER, THEME]
-                .into_iter()
-                .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)
-                .chain(ui::RULE_ROW..ui::RULE_ROW + GESTURES.len() as i32)
+            for id in [
+                TOGGLE,
+                IDLE,
+                LINGER,
+                THEME_DARK,
+                THEME_LIGHT,
+                FULLSCREEN,
+                EXCLUSIONS,
+            ]
+            .into_iter()
+            .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)
+            .chain(ui::RULE_ROW..ui::RULE_ROW + GESTURES.len() as i32)
             {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                     GetDlgItem(hwnd, id),

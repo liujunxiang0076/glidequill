@@ -32,6 +32,23 @@ public static class GestureSmoke {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
     [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr w, IntPtr rect, IntPtr region, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetLastActivePopup(IntPtr owner);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool PostMessage(IntPtr w,uint msg,IntPtr wp,IntPtr lp);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,EntryPoint="SendMessageW")] public static extern IntPtr SendText(IntPtr w,uint msg,IntPtr id,string value);
+    delegate bool EnumProc(IntPtr h,IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr w,EnumProc proc,IntPtr l);
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr w);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr w,StringBuilder name,int max);
+    public static IntPtr FileNameEdit(IntPtr dialog) {
+        IntPtr edit=IntPtr.Zero;
+        EnumChildWindows(dialog,(h,l)=>{
+            var name=new StringBuilder(64);
+            GetClassName(h,name,64);
+            if(GetDlgCtrlID(h)==1148 && name.ToString()=="Edit") edit=h;
+            return edit==IntPtr.Zero;
+        },IntPtr.Zero);
+        return edit;
+    }
     public static double ClickAndPaint(IntPtr w,int id) {
         var button = GetDlgItem(w,id);
         var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -52,6 +69,25 @@ function Get-Label($window, $id) {
     $text = [Text.StringBuilder]::new(256)
     [void][GestureSmoke]::GetWindowText([GestureSmoke]::GetDlgItem($window,$id),$text,256)
     $text.ToString()
+}
+function Show-TestDialog($w,$command) {
+    Require ([GestureSmoke]::PostMessage($w,0x111,[IntPtr]$command,[IntPtr]::Zero)) 'Dialog command failed'
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        $dialog=[GestureSmoke]::GetLastActivePopup($w)
+        if ($dialog -ne $w -and [GestureSmoke]::IsWindowVisible($dialog)) { return $dialog }
+        Start-Sleep -Milliseconds 25
+    } while ($timer.ElapsedMilliseconds -lt 5000)
+    throw "Dialog did not open for command $command"
+}
+function Close-TestDialog($dialog,$id) {
+    $button=[GestureSmoke]::GetDlgItem($dialog,$id)
+    Require ([GestureSmoke]::PostMessage($button,0xf5,[IntPtr]::Zero,[IntPtr]::Zero)) "Cannot invoke dialog action $id"
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    while ([GestureSmoke]::IsWindowVisible($dialog) -and $timer.ElapsedMilliseconds -lt 5000) {Start-Sleep -Milliseconds 25}
+    if ([GestureSmoke]::IsWindowVisible($dialog)) {
+        throw "Dialog action $id did not close the dialog"
+    }
 }
 function Save-Screenshot($w,$name) {
     if (!$ScreenshotDirectory) { return }
@@ -152,6 +188,14 @@ try {
             [void][GestureSmoke]::GetWindowRect([GestureSmoke]::GetDlgItem($w,$id),[ref]$bounds)
             Require ($bounds.Left -ge $corner.X -and $bounds.Top -ge $corner.Y -and $bounds.Right -le $corner.X+$client.Right -and $bounds.Bottom -le $corner.Y+$client.Bottom) "Compact layout clipped control $id"
         }
+        [void](Send $w 0x111 130)
+        $scroll=[GestureSmoke]::GetDlgItem($w,190)
+        Require ([GestureSmoke]::IsWindowVisible($scroll)) 'Compact General has no scrollbar'
+        [void](Send $w 0x115 7 $scroll)
+        Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,180))) 'Theme is unreachable on compact layout'
+        [void](Send $w 0x115 6 $scroll)
+        Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,121))) 'Global toggle lost after scrolling'
+        [void](Send $w 0x111 134)
     } finally {
         [void][GestureSmoke]::SetWindowPos($w,[IntPtr]::Zero,0,0,$sw,$sh,0x16)
         [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior)
@@ -188,6 +232,17 @@ try {
     $turn=[GestureSmoke]::GetDlgItem($w,173)
     Require ([GestureSmoke]::IsWindowVisible($turn) -and ![GestureSmoke]::IsWindowVisible($diagonal)) 'Wrong gesture group'
     Require (![GestureSmoke]::IsWindowEnabled($reset)) 'Other group affected special reset'
+    [void](Send $turn 0x14e 6)
+    [void](Send $w 0x111 (0x10000+173) $turn)
+    Require ((Get-Label $w 188) -eq '有 2 项未保存') 'Cross-group draft count is incorrect'
+    [void](Send $turn 0x14e 0)
+    [void](Send $w 0x111 (0x10000+173) $turn)
+    Require ((Get-Label $w 188) -eq '有 1 项未保存') 'Reverted binding still counted'
+    [void](Send $diagonal 0x14e 0)
+    [void](Send $w 0x111 (0x10000+165) $diagonal)
+    Require ((Get-Label $w 188) -eq '' -and ![GestureSmoke]::IsWindowEnabled($apply)) 'Reverting all drafts left Save enabled'
+    [void](Send $diagonal 0x14e 5)
+    [void](Send $w 0x111 (0x10000+165) $diagonal)
     [void](Send $turn 0x14e 6)
     [void](Send $w 0x111 (0x10000+173) $turn)
     Save-Screenshot $w 'windows-special.png'
@@ -251,7 +306,44 @@ try {
     Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,131))) 'Missing general settings'
     Require (![GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'Timing control visible in General'
     Require ((Get-Label $w 131) -eq '启用登录自启') 'Autostart should default off'
+    Require ((Get-Label $w 181) -like '*已开启') 'Legacy preferences must pause fullscreen by default'
+    [void](Send $w 0x111 181)
+    Require (!(Get-Content $prefsFile -Raw | ConvertFrom-Json).pause_fullscreen) 'Fullscreen switch not persisted'
     Save-Screenshot $w 'windows-settings.png'
+    [void](Send $w 0x111 182)
+    $list=[GestureSmoke]::GetDlgItem($w,183)
+    Require ((Send $list 0x18b).ToInt32() -eq 1) 'Legacy exclusion list missing'
+    [void](Send $list 0x186 0)
+    [void](Send $w 0x111 (0x10000+183) $list)
+    [void](Send $w 0x111 185)
+    $exclusionsFile=Join-Path $legacyDir 'excluded.json'
+    Require (!(Test-Path -LiteralPath $exclusionsFile)) 'Removal applied before saving'
+    [void](Send $w 0x111 186)
+    Require ((Get-Content $exclusionsFile -Raw).Trim() -eq '[]') 'Empty override not persisted'
+    # Choose a real executable twice; the second choice selects the existing draft entry.
+    foreach ($round in 1..2) {
+        $dialog=Show-TestDialog $w 184
+        $timer=[Diagnostics.Stopwatch]::StartNew()
+        do {
+            $edit=[GestureSmoke]::FileNameEdit($dialog)
+            if ($edit -ne 0) {break}
+            Start-Sleep -Milliseconds 25
+        } while ($timer.ElapsedMilliseconds -lt 5000)
+        Require ($edit -ne 0) 'Native filename editor missing'
+        [void][GestureSmoke]::SendText($edit,0x0c,[IntPtr]::Zero,$exe)
+        Close-TestDialog $dialog 1
+        $timer.Restart()
+        while ((Send $list 0x18b).ToInt32() -ne 1 -and $timer.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
+        Require ((Send $list 0x18b).ToInt32() -eq 1) 'File picker missed or duplicated executable'
+    }
+    Require ((Get-Content $exclusionsFile -Raw).Trim() -eq '[]') 'Adding an executable committed its draft'
+    $dialog=Show-TestDialog $w 187
+    Close-TestDialog $dialog 2
+    Require ([GestureSmoke]::IsWindowVisible($list)) 'Cancel did not preserve the exclusions draft'
+    $dialog=Show-TestDialog $w 187
+    Close-TestDialog $dialog 7
+    Require (![GestureSmoke]::IsWindowVisible($list)) 'Discard did not navigate back'
+    Require ((Get-Label $w 182) -like '*0 个应用') 'Wrong exclusion count'
     [void](Send $w 0x111 131)
     Require ((Get-ItemPropertyValue -LiteralPath $testKey -Name GlideQuill) -ceq ('"'+$exe+'" --startup')) 'Bad logon command'
     [void](Send $w 0x111 135)
@@ -271,7 +363,7 @@ try {
     }
     [void](Send $w 0x111 121)
     [void](Send $w 0x111 127)
-    Require ((Get-Label $w 127) -eq '浅色') 'Theme failed'
+    Require ((Get-Label $w 127) -eq '深色 · 已选中') 'Theme failed'
     [void](Send $w 0x111 134)
     Save-Screenshot $w 'windows-dark.png'
     [void](Send $w 0x10)
@@ -299,7 +391,11 @@ try {
     [void](Send $w 0x111 130)
     Require ((Send ([GestureSmoke]::GetDlgItem($w,165)) 0x147).ToInt32() -eq 5) 'Diagonal binding not restored'
     Require ((Send ([GestureSmoke]::GetDlgItem($w,173)) 0x147).ToInt32() -eq 6) 'Saved special binding not restored'
-    Require ((Get-Label $w 127) -eq '浅色') 'Theme was not restored'
+    Require ((Get-Label $w 127) -eq '深色 · 已选中') 'Theme was not restored'
+    Require ((Get-Label $w 181) -like '*已关闭') 'Fullscreen switch was not restored'
+    Require ((Get-Label $w 182) -like '*0 个应用') 'Deleted legacy exclusion returned after restart'
+    [void](Send $w 0x111 180)
+    Require ((Get-Label $w 180) -eq '浅色 · 已选中') 'Light theme could not be selected'
     Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting was not restored'
     Require ((Get-Label $w 133) -like '*0.25 秒') 'Result setting was not restored'
     Require ((Get-Label $w 131) -eq '关闭登录自启') 'Autostart registration not detected'

@@ -45,7 +45,8 @@ unsafe fn eligible(point: POINT) -> Option<HWND> {
             ..Default::default()
         };
         let mut rect = RECT::default();
-        if GetMonitorInfoW(MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST), &mut mi) != 0
+        if settings::preferences().pause_fullscreen
+            && GetMonitorInfoW(MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST), &mut mi) != 0
             && GetWindowRect(target, &mut rect) != 0
             && rect.left <= mi.rcMonitor.left
             && rect.top <= mi.rcMonitor.top
@@ -252,6 +253,17 @@ mod tests {
             std::fs::create_dir(&test_dir).unwrap();
             std::fs::write(test_dir.join("settings.json"),r#"{"bindings":["back","forward","home","end","copy","paste","minimize","unassigned","end","unassigned","unassigned","unassigned","unassigned","copy","unassigned","unassigned"]}"#).unwrap();
             settings::load_from(&test_dir).unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let name = exe.file_name().unwrap().to_string_lossy().to_uppercase();
+            settings::save_exclusions_in(&test_dir, &[name]).unwrap();
+            assert_eq!(
+                eligible(start),
+                None,
+                "saved exclusion must bypass the next stroke"
+            );
+            settings::save_exclusions_in(&test_dir, &[]).unwrap();
+            assert_eq!(eligible(start), Some(hwnd));
+            std::fs::remove_file(test_dir.join("excluded.json")).unwrap();
             std::fs::remove_file(test_dir.join("settings.json")).unwrap();
             std::fs::remove_dir(test_dir).unwrap();
             for (x, y, expected) in [
@@ -409,7 +421,7 @@ mod tests {
             std::fs::write(dir.join("settings.json"), r#"{"idle_ms":0,"result_ms":0}"#).unwrap();
             settings::load_from(&dir).unwrap();
             std::fs::remove_file(dir.join("settings.json")).unwrap();
-            std::fs::remove_dir(dir).unwrap();
+
             assert!(gesture(WM_RBUTTONDOWN, start));
             gesture(WM_MOUSEMOVE, end);
             overlay::refresh(hwnd);
@@ -419,6 +431,41 @@ mod tests {
             assert!(gesture(WM_RBUTTONUP, end));
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
+            let mut monitor = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            assert_ne!(
+                GetMonitorInfoW(
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                    &mut monitor
+                ),
+                0
+            );
+            let r = monitor.rcMonitor;
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_SHOWWINDOW,
+            );
+            assert_eq!(
+                eligible(start),
+                None,
+                "fullscreen must be bypassed by default"
+            );
+            std::fs::write(dir.join("settings.json"), r#"{"pause_fullscreen":false}"#).unwrap();
+            settings::load_from(&dir).unwrap();
+            assert_eq!(
+                eligible(start),
+                Some(hwnd),
+                "fullscreen opt-in must take effect"
+            );
+            std::fs::remove_file(dir.join("settings.json")).unwrap();
+            std::fs::remove_dir(dir).unwrap();
             overlay::destroy();
             DestroyWindow(hwnd);
         }
