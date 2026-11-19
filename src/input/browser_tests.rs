@@ -12,7 +12,14 @@ fn title(window: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 // Keep the same layered windows visible during dispatch as on the interactive desktop.
-struct FeedbackWindow(HWND, HWINEVENTHOOK);
+pub(super) static TEST_TARGET: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+pub(super) const TEST_MOUSE_TAG: usize = 0x4751_5453;
+struct FeedbackWindow {
+    host: HWND,
+    listener: Option<crate::engine::Listener>,
+    previous_cursor: POINT,
+}
 impl FeedbackWindow {
     fn new() -> Self {
         unsafe {
@@ -32,29 +39,26 @@ impl FeedbackWindow {
             );
             assert!(!host.is_null());
             crate::WINDOW.set(host);
-            initialize(host, false);
             overlay::create().unwrap();
-            use windows_sys::Win32::UI::Accessibility::SetWinEventHook;
-            let focus_hook = SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
-                null_mut(),
-                Some(foreground_changed),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            assert!(!focus_hook.is_null());
-            Self(host, focus_hook)
+            let mut previous_cursor = POINT::default();
+            assert_ne!(GetCursorPos(&mut previous_cursor), 0);
+            let listener = crate::engine::Listener::start(host, false).unwrap();
+            Self {
+                host,
+                listener: Some(listener),
+                previous_cursor,
+            }
         }
     }
 }
 impl Drop for FeedbackWindow {
     fn drop(&mut self) {
         unsafe {
-            windows_sys::Win32::UI::Accessibility::UnhookWinEvent(self.1);
+            drop(self.listener.take());
+            TEST_TARGET.store(null_mut(), std::sync::atomic::Ordering::SeqCst);
+            SetCursorPos(self.previous_cursor.x, self.previous_cursor.y);
             overlay::destroy();
-            DestroyWindow(self.0);
+            DestroyWindow(self.host);
         }
         crate::WINDOW.set(null_mut());
     }
@@ -165,7 +169,7 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
         let wanted = format!("GlideQuill action test {state}");
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(3) {
-            // Out-of-context foreground events are delivered to the installing thread.
+            // Pump the test settings window while the input listener runs independently.
             unsafe {
                 let mut msg = MSG::default();
                 while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -187,33 +191,69 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
     fn swipe_with_foreground(&self, dx: i32, dy: i32, foreground: HWND) {
         unsafe {
             assert_eq!(GetForegroundWindow(), foreground);
-            let mut rect = RECT::default();
-            assert_ne!(GetWindowRect(self.window, &mut rect), 0);
-            let center = POINT {
-                x: (rect.left + rect.right) / 2,
-                y: (rect.top + rect.bottom) / 2,
-            };
+            // Windows can report the new zoom state before the position and
+            // hit-tested surface have settled during a restore animation.
             let start = Instant::now();
-            while GetAncestor(WindowFromPoint(center), GA_ROOT) != self.window
-                && start.elapsed() < Duration::from_secs(2)
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert_eq!(GetAncestor(WindowFromPoint(center), GA_ROOT), self.window);
-            let end = POINT {
-                x: center.x + dx,
-                y: center.y + dy,
+            let mut previous = None;
+            let mut stable_since = Instant::now();
+            let center = loop {
+                let mut rect = RECT::default();
+                assert_ne!(GetWindowRect(self.window, &mut rect), 0);
+                let bounds = (rect.left, rect.top, rect.right, rect.bottom);
+                let point = POINT {
+                    x: (rect.left + rect.right) / 2,
+                    y: (rect.top + rect.bottom) / 2,
+                };
+                if previous != Some(bounds)
+                    || GetAncestor(WindowFromPhysicalPoint(point), GA_ROOT) != self.window
+                {
+                    previous = Some(bounds);
+                    stable_since = Instant::now();
+                } else if stable_since.elapsed() >= Duration::from_millis(120) {
+                    break point;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "test surface not exposed"
+                );
+                std::thread::sleep(Duration::from_millis(15));
             };
-            assert!(
-                gesture(WM_RBUTTONDOWN, center),
-                "stroke {dx},{dy}: hit={:?}, target={:?}, zoomed={}, style={:x}",
-                GetAncestor(WindowFromPoint(center), GA_ROOT),
-                self.window,
-                IsZoomed(self.window),
-                GetWindowLongW(self.window, GWL_STYLE)
-            );
-            gesture(WM_MOUSEMOVE, end);
-            overlay::refresh(crate::app_window());
+            let zoom = IsZoomed(self.window);
+            TEST_TARGET.store(self.window, std::sync::atomic::Ordering::SeqCst);
+            mouse_event_at(center, MOUSEEVENTF_MOVE);
+            mouse_event_at(center, MOUSEEVENTF_RIGHTDOWN);
+            struct HeldButton(POINT);
+            impl Drop for HeldButton {
+                fn drop(&mut self) {
+                    unsafe { mouse_event_at(self.0, MOUSEEVENTF_RIGHTUP) };
+                }
+            }
+            let mut held = HeldButton(center);
+            for i in 1..=12 {
+                held.0 = POINT {
+                    x: center.x + dx * i / 12,
+                    y: center.y + dy * i / 12,
+                };
+                mouse_event_at(held.0, MOUSEEVENTF_MOVE);
+                if i == 6 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert_ne!(IsWindow(self.window), 0);
+                    assert_eq!(
+                        (IsZoomed(self.window), IsIconic(self.window)),
+                        (zoom, 0),
+                        "window moved mid-stroke"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(250) {
+                overlay::refresh(crate::app_window());
+                if IsWindowVisible(overlay::test_subtitle()) != 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert_ne!(
                 IsWindowVisible(overlay::test_subtitle()),
                 0,
@@ -224,9 +264,44 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
                 foreground,
                 "feedback changed focus before release"
             );
-            assert!(gesture(WM_RBUTTONUP, end));
+            drop(held);
+            assert_eq!(
+                (IsZoomed(self.window), IsIconic(self.window)),
+                (zoom, 0),
+                "window changed on release without settling"
+            );
             overlay::refresh(crate::app_window());
         }
+    }
+}
+// Exercise the OS hook queue at desktop coordinates, including the physical
+// right-button state. Only the test binary accepts these tagged samples.
+unsafe fn mouse_event_at(point: POINT, flags: u32) {
+    unsafe {
+        let normalized = |value, origin, extent| {
+            (((value - origin) as i64 * 65536 + 32768) / extent as i64) as i32
+        };
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: normalized(
+                        point.x,
+                        GetSystemMetrics(SM_XVIRTUALSCREEN),
+                        GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    ),
+                    dy: normalized(
+                        point.y,
+                        GetSystemMetrics(SM_YVIRTUALSCREEN),
+                        GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                    ),
+                    dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    dwExtraInfo: TEST_MOUSE_TAG,
+                    ..Default::default()
+                },
+            },
+        };
+        assert_eq!(SendInput(1, &input, size_of::<INPUT>() as i32), 1);
     }
 }
 impl Drop for Browser {
@@ -355,6 +430,12 @@ fn external_browser_actions() {
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert_ne!(IsZoomed(browser.window), 0);
+            if !custom_frame {
+                // Reproduce the stale menu state observed on a real maximized Edge window.
+                let menu = GetSystemMenu(browser.window, 0);
+                EnableMenuItem(menu, SC_RESTORE, MF_BYCOMMAND | MF_GRAYED);
+                assert_ne!(GetMenuState(menu, SC_RESTORE, MF_BYCOMMAND) & MF_GRAYED, 0);
+            }
             for want_maximized in [false, true, false] {
                 browser.swipe(120, -120);
                 let start = Instant::now();

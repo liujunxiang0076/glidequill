@@ -26,6 +26,17 @@ struct PendingShortcut {
     key: u16,
 }
 const ACTIVATION_TIMEOUT_MS: u32 = 350;
+const WINDOW_ACTION_DELAY_MS: u32 = 180;
+
+#[derive(Clone, Copy)]
+struct ReleasedWindowAction {
+    window: HWND,
+    foreground: HWND,
+    pid: u32,
+    action: Action,
+    released_at: u32,
+    timer: usize,
+}
 
 struct Capture {
     target: Target,
@@ -46,6 +57,7 @@ impl Capture {
 }
 thread_local! {
     static CAPTURE:RefCell<Option<Capture>>=const{RefCell::new(None)};
+    static RELEASED: Cell<Option<ReleasedWindowAction>> = const { Cell::new(None) };
     static PENDING: Cell<Option<PendingShortcut>> = const { Cell::new(None) };
     static SETTINGS_WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static PASS_THROUGH:Cell<bool>=const{Cell::new(false)};
@@ -56,7 +68,7 @@ pub fn initialize(window: HWND, pass_through: bool) {
 }
 unsafe fn eligible(point: POINT) -> Option<Target> {
     unsafe {
-        let target = GetAncestor(WindowFromPoint(point), GA_ROOT);
+        let target = GetAncestor(WindowFromPhysicalPoint(point), GA_ROOT);
         let foreground = GetForegroundWindow();
         if foreground.is_null()
             || target.is_null()
@@ -138,6 +150,12 @@ pub unsafe extern "system" fn foreground_changed(
     _: u32,
     event_time: u32,
 ) {
+    if let Some(released) = RELEASED.get()
+        && hwnd != released.foreground
+        && event_time.wrapping_sub(released.released_at) as i32 >= 0
+    {
+        cancel_window_action();
+    }
     // Foreground activation across input queues can complete after mouse-up.
     if let Some(pending) = PENDING.get()
         && event_time.wrapping_sub(pending.requested) as i32 >= 0
@@ -175,6 +193,60 @@ fn modifiers_pressed() -> bool {
     .any(|&key| unsafe { GetAsyncKeyState(key as i32) < 0 })
 }
 
+fn cancel_window_action() {
+    if let Some(pending) = RELEASED.take() {
+        unsafe {
+            KillTimer(null_mut(), pending.timer);
+        }
+    }
+}
+
+unsafe fn schedule_window_action(target: &Target, action: Action) {
+    cancel_window_action();
+    unsafe {
+        let timer = SetTimer(
+            null_mut(),
+            0,
+            WINDOW_ACTION_DELAY_MS,
+            Some(commit_window_action),
+        );
+        if timer != 0 {
+            RELEASED.set(Some(ReleasedWindowAction {
+                window: target.window,
+                foreground: target.foreground,
+                pid: target.pid,
+                action,
+                released_at: GetTickCount(),
+                timer,
+            }));
+        }
+    }
+}
+
+unsafe extern "system" fn commit_window_action(_: HWND, _: u32, timer: usize, _: u32) {
+    let Some(pending) = RELEASED.get().filter(|pending| pending.timer == timer) else {
+        return;
+    };
+    unsafe {
+        let elapsed = GetTickCount().wrapping_sub(pending.released_at);
+        if elapsed < WINDOW_ACTION_DELAY_MS {
+            return;
+        }
+        cancel_window_action();
+        let mut pid = 0;
+        GetWindowThreadProcessId(pending.window, &mut pid);
+        if elapsed < 1000
+            && pid == pending.pid
+            && GetForegroundWindow() == pending.foreground
+            && IsWindowEnabled(pending.window) != 0
+            && IsIconic(pending.window) == 0
+            && GetAsyncKeyState(VK_RBUTTON.into()) >= 0
+        {
+            execute(pending.window, pending.action);
+        }
+    }
+}
+
 // Windows owns minimize/maximize placement even when an app draws its own caption.
 unsafe fn change_window_state(target: HWND, action: Action) {
     unsafe {
@@ -186,6 +258,19 @@ unsafe fn change_window_state(target: HWND, action: Action) {
             _ => return,
         };
         if style & WS_SYSMENU != 0 {
+            // Chromium updates its native menu on demand. Its cached Restore item
+            // can still be grey on a maximized window. Let the browser handle the
+            // same system command as its own caption buttons.
+            let mut class = [0; 64];
+            let len = GetClassNameW(target, class.as_mut_ptr(), class.len() as i32);
+            if class[..len as usize]
+                .iter()
+                .copied()
+                .eq("Chrome_WidgetWin_1".encode_utf16())
+            {
+                PostMessageW(target, WM_SYSCOMMAND, command as usize, 0);
+                return;
+            }
             let menu = GetSystemMenu(target, 0);
             if !menu.is_null() {
                 let state = GetMenuState(menu, command, MF_BYCOMMAND);
@@ -284,6 +369,13 @@ unsafe fn send_shortcut(target: HWND, modifier: Option<u16>, key: u16) {
 }
 unsafe fn execute(target: HWND, action: Action) {
     unsafe {
+        #[cfg(test)]
+        {
+            let expected = browser_tests::TEST_TARGET.load(std::sync::atomic::Ordering::SeqCst);
+            if !expected.is_null() && expected != target {
+                return;
+            }
+        }
         if modifiers_pressed() {
             return;
         }
@@ -323,7 +415,11 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
             return CallNextHookEx(null_mut(), code, msg, data);
         }
         let e = &*(data as *const MSLLHOOKSTRUCT);
-        if e.flags & LLMHF_INJECTED != 0 {
+        #[cfg(test)]
+        let ignore = e.dwExtraInfo != browser_tests::TEST_MOUSE_TAG;
+        #[cfg(not(test))]
+        let ignore = e.flags & LLMHF_INJECTED != 0;
+        if ignore {
             return CallNextHookEx(null_mut(), code, msg, data);
         }
         if gesture(msg as u32, e.pt) {
@@ -345,6 +441,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                 | WM_MOUSEHWHEEL
         ) {
             PENDING.set(None);
+            cancel_window_action();
         }
         match msg {
             WM_RBUTTONDOWN => {
@@ -410,13 +507,18 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                         overlay::cancel(window);
                     } else if s.stroke.is_click() {
                         overlay::cancel(window);
-                        if GetAncestor(WindowFromPoint(point), GA_ROOT) == s.target.window {
+                        if GetAncestor(WindowFromPhysicalPoint(point), GA_ROOT) == s.target.window {
                             replay_click();
                         }
                     } else {
                         let action = s.stroke.gesture().map(|d| s.target.bindings[d as usize]);
                         if let Some(action) = overlay::finish(window, point, action) {
-                            execute(s.target.window, action);
+                            if matches!(action, Action::Minimize | Action::Maximize | Action::Close)
+                            {
+                                schedule_window_action(&s.target, action);
+                            } else {
+                                execute(s.target.window, action);
+                            }
                         }
                     }
                     true

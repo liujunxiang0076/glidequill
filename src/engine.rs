@@ -33,6 +33,10 @@ impl Listener {
             let thread = thread::Builder::new()
                 .name("gesture-input".into())
                 .spawn(move || {
+                    use windows_sys::Win32::UI::HiDpi::{
+                        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+                    };
+                    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
                     input::initialize(window_id as HWND, pass_through);
                     let hook = SetWindowsHookExW(
                         WH_MOUSE_LL,
