@@ -6,6 +6,7 @@ mod engine;
 mod exclusions;
 mod input;
 mod overlay;
+mod rules;
 mod settings;
 mod startup;
 mod ui;
@@ -203,63 +204,6 @@ fn toggle() {
     set_enabled(!was, true);
     ui::animate_switch(TOGGLE, was, LISTENER.with(|v| v.borrow().is_some()));
 }
-// The native selections are the draft. The listener reads only committed preferences.
-fn selected_bindings() -> Option<[Action; GESTURES.len()]> {
-    let mut bindings = DEFAULT_BINDINGS;
-    for (index, binding) in bindings.iter_mut().enumerate() {
-        let selected = unsafe {
-            let field = GetDlgItem(app_window(), ui::PICKER + index as i32);
-            SendMessageW(field, CB_GETCURSEL, 0, 0)
-        };
-        *binding = *ACTIONS.get(selected as usize)?;
-    }
-    Some(bindings)
-}
-fn update_rule_buttons() {
-    let draft = selected_bindings().filter(|_| CONFIG_READABLE.with(Cell::get));
-    let saved = settings::preferences().bindings;
-    let count = draft.map_or(0, |b| {
-        b.iter().zip(saved).filter(|(a, b)| **a != *b).count()
-    });
-    label(
-        DIRTY_RULES,
-        &if count == 0 {
-            String::new()
-        } else {
-            format!("有 {count} 项未保存")
-        },
-    );
-    unsafe {
-        for (id, enabled) in [
-            (SAVE_RULES, count != 0),
-            (
-                RESET_RULES,
-                draft.is_some_and(|b| b[rule_range()] != DEFAULT_BINDINGS[rule_range()]),
-            ),
-        ] {
-            let button = GetDlgItem(app_window(), id);
-            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
-            if (IsWindowEnabled(button) != 0) != enabled {
-                EnableWindow(button, enabled.into());
-                InvalidateRect(button, null_mut(), 0);
-            }
-        }
-    }
-}
-fn save_bindings() {
-    let Some(bindings) = selected_bindings() else {
-        return;
-    };
-    let prefs = settings::preferences();
-    if bindings == prefs.bindings {
-        return;
-    }
-    match settings::save(settings::Preferences { bindings, ..prefs }) {
-        Ok(()) => label(RESULT, "规则已保存并重载，将用于下一笔手势"),
-        Err(e) => label(RESULT, &format!("保存失败，修改已保留：{e}")),
-    }
-    update_rule_buttons();
-}
 fn apply_theme(w: HWND, dark: bool) {
     DARK.with(|v| v.set(dark));
     label(
@@ -367,7 +311,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 ui::set_dpi(GetDpiForWindow(w));
                 ui::measure(w);
                 ui::build();
-                update_rule_buttons();
+                rules::update_buttons();
                 ui::layout();
                 if overlay::create().is_err() {
                     return -1;
@@ -499,23 +443,25 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     id if (ui::PICKER..ui::PICKER + GESTURES.len() as i32).contains(&id)
                         && matches!((wp >> 16) as u32, CBN_SELCHANGE | CBN_CLOSEUP) =>
                     {
-                        update_rule_buttons();
+                        rules::field_changed(id);
                         InvalidateRect(GetDlgItem(w, id), null_mut(), 0);
                     }
                     BASIC_TAB | RETURN_TAB | CORNER_TAB => {
                         if ACTIVE_TAB.replace(id) != id {
                             ui::switch_group();
-                            update_rule_buttons();
+                            rules::update_buttons();
                         }
                     }
-                    SAVE_RULES if CONFIG_READABLE.with(Cell::get) => save_bindings(),
-                    RESET_RULES if CONFIG_READABLE.with(Cell::get) => {
-                        for index in rule_range() {
-                            let action = DEFAULT_BINDINGS[index];
-                            let field = GetDlgItem(w, ui::PICKER + index as i32);
-                            SendMessageW(field, CB_SETCURSEL, action as usize, 0);
-                        }
-                        update_rule_buttons();
+                    SAVE_RULES if CONFIG_READABLE.get() => rules::save(),
+                    RESET_RULES if CONFIG_READABLE.get() => rules::reset_group(),
+                    rules::SCOPE if PAGE.get() == Page::Rules && CONFIG_READABLE.get() => {
+                        rules::menu(w)
+                    }
+                    id if PAGE.get() == Page::Rules
+                        && CONFIG_READABLE.get()
+                        && rules::is_scope_command(id) =>
+                    {
+                        rules::scope_command(id)
                     }
                     AUTOSTART => {
                         let was = STARTUP_ON.with(Cell::get);
@@ -825,6 +771,7 @@ fn main() {
                 THEME_LIGHT,
                 FULLSCREEN,
                 EXCLUSIONS,
+                rules::SCOPE,
             ]
             .into_iter()
             .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)

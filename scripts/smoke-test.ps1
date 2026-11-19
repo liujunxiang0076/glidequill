@@ -116,6 +116,18 @@ function Save-Screenshot($w,$name) {
     }
     finally { $bmp.Dispose() }
 }
+function Select-TestExecutable($w,$command) {
+    $dialog=Show-TestDialog $w $command
+    $timer=[Diagnostics.Stopwatch]::StartNew()
+    do {
+        $edit=[GestureSmoke]::FileNameEdit($dialog)
+        if ($edit -ne 0) {break}
+        Start-Sleep -Milliseconds 25
+    } while ($timer.ElapsedMilliseconds -lt 5000)
+    Require ($edit -ne 0) 'Native filename editor missing'
+    [void][GestureSmoke]::SendText($edit,0x0c,[IntPtr]::Zero,$exe)
+    Close-TestDialog $dialog 1
+}
 function Require($condition,$message) { if (!$condition) { throw $message } }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('glidequill-test-' + [guid]::NewGuid())
@@ -267,6 +279,36 @@ try {
     Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Save left the draft dirty'
     $saved=Get-Content $prefsFile -Raw | ConvertFrom-Json
     Require ($saved.bindings[5] -eq 'copy' -and $saved.bindings[4] -eq 'paste' -and $saved.bindings[13] -eq 'paste' -and $saved.idle_ms -eq 1000) 'Keyboard selection or preference preservation failed'
+    # Stage an explicit disable and an override while the remaining gestures inherit.
+    $common=[GestureSmoke]::GetDlgItem($w,160)
+    $appKey=[IO.Path]::GetFileName($exe).ToLowerInvariant()
+    Select-TestExecutable $w 194
+    $scopeTimer=[Diagnostics.Stopwatch]::StartNew()
+    while ((Get-Label $w 192) -notlike "*$appKey*" -and $scopeTimer.ElapsedMilliseconds -lt 3000) { Start-Sleep -Milliseconds 25 }
+    Require ((Get-Label $w 192) -like "*$appKey*" -and (Send $common 0x147).ToInt32() -eq 10) 'Application did not start with inheritance'
+    [void](Send $common 0x14e 0)
+    [void](Send $w 0x111 (0x10000+160) $common)
+    [void](Send $diagonal 0x14e 6)
+    [void](Send $w 0x111 (0x10000+165) $diagonal)
+    [void](Send $w 0x111 193)
+    Require ((Send $common 0x147).ToInt32() -eq 1 -and (Send $diagonal 0x147).ToInt32() -eq 5) 'Application edit leaked into global draft'
+    [void](Send $w 0x111 300)
+    Require ((Send $common 0x147).ToInt32() -eq 0 -and (Send $diagonal 0x147).ToInt32() -eq 6) 'Scope switch lost application draft'
+    [void](Send $w 0x111 135)
+    [void](Send $w 0x111 203)
+    Require ($null -eq (Get-Content $prefsFile -Raw | ConvertFrom-Json).applications) 'Timing change committed draft rules'
+    [void](Send $w 0x111 134)
+    [void](Send $apply 0xf5)
+    $profile=(Get-Content $prefsFile -Raw | ConvertFrom-Json).applications.$appKey
+    Require ($profile[0] -eq 'unassigned' -and $null -eq $profile[1] -and $profile[5] -eq 'paste') 'Inheritance and explicit unbinding were not persisted distinctly'
+    Save-Screenshot $w 'windows-app-rules.png'
+    [void](Send $w 0x111 193)
+    Select-TestExecutable $w 194
+    $scopeTimer.Restart()
+    while ((Get-Label $w 192) -notlike "*$appKey*" -and $scopeTimer.ElapsedMilliseconds -lt 3000) { Start-Sleep -Milliseconds 25 }
+    Require ((Get-Label $w 192) -like "*$appKey*") 'Duplicate file selection did not switch scope'
+    Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Selecting the same app created another draft'
+    [void](Send $w 0x111 193)
     # Press the hover clear target; the chevron and keyboard still open the native list.
     $dpi=[GestureSmoke]::GetDpiForWindow($diagonal)
     $rect=[GestureSmoke+Bounds]::new()
@@ -333,17 +375,8 @@ try {
     Require ((Get-Content $exclusionsFile -Raw).Trim() -eq '[]') 'Empty override not persisted'
     # Choose a real executable twice; the second choice selects the existing draft entry.
     foreach ($round in 1..2) {
-        $dialog=Show-TestDialog $w 184
+        Select-TestExecutable $w 184
         $timer=[Diagnostics.Stopwatch]::StartNew()
-        do {
-            $edit=[GestureSmoke]::FileNameEdit($dialog)
-            if ($edit -ne 0) {break}
-            Start-Sleep -Milliseconds 25
-        } while ($timer.ElapsedMilliseconds -lt 5000)
-        Require ($edit -ne 0) 'Native filename editor missing'
-        [void][GestureSmoke]::SendText($edit,0x0c,[IntPtr]::Zero,$exe)
-        Close-TestDialog $dialog 1
-        $timer.Restart()
         while ((Send $list 0x18b).ToInt32() -ne 1 -and $timer.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 25 }
         Require ((Send $list 0x18b).ToInt32() -eq 1) 'File picker missed or duplicated executable'
     }
@@ -406,6 +439,16 @@ try {
     Require ((Get-Label $w 127) -eq '深色 · 已选中') 'Theme was not restored'
     Require ((Get-Label $w 181) -like '*已关闭') 'Fullscreen switch was not restored'
     Require ((Get-Label $w 182) -like '*0 个应用') 'Deleted legacy exclusion returned after restart'
+    [void](Send $w 0x111 134)
+    [void](Send $w 0x111 300)
+    Require ((Get-Label $w 192) -like "*$appKey*" -and (Send ([GestureSmoke]::GetDlgItem($w,160)) 0x147).ToInt32() -eq 0) 'Saved application overrides did not survive a restart'
+    [void](Send $w 0x111 136)
+    Require ((Send ([GestureSmoke]::GetDlgItem($w,160)) 0x147).ToInt32() -eq 10) 'Application reset did not restore inheritance'
+    [void](Send $w 0x111 195)
+    Require ((Get-Content $prefsFile -Raw | ConvertFrom-Json).applications.$appKey[5] -eq 'paste') 'Removing an app bypassed Save'
+    [void](Send $w 0x111 137)
+    Require ($null -eq (Get-Content $prefsFile -Raw | ConvertFrom-Json).applications) 'Application removal was not persisted'
+    [void](Send $w 0x111 130)
     [void](Send $w 0x111 180)
     Require ((Get-Label $w 180) -eq '浅色 · 已选中') 'Light theme could not be selected'
     Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting was not restored'
@@ -421,7 +464,7 @@ try {
     Require ((Get-Label $p.MainWindowHandle 121) -eq '启用全局手势') 'Paused state not restored'
     [void](Send $p.MainWindowHandle 0x111 124)
     Require ($p.WaitForExit(5000)) 'Final exit failed'
-    Write-Output 'PASS: centered branded window, embedded icon, basic and two-leg bindings, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray and legacy configuration.'
+    Write-Output 'PASS: centered branded window, embedded icon, basic and two-leg bindings, per-app overrides and inheritance, draft navigation, save failure/retry, hover clear, staged reset, restart isolation, settings, theme, tray and legacy configuration.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     if (Test-Path -LiteralPath $testKey) {Remove-Item -LiteralPath $testKey}

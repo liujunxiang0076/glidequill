@@ -57,10 +57,10 @@ pub fn open() {
         },
     );
 }
-pub unsafe fn pick(owner: HWND) {
+pub(super) fn choose_executable(owner: HWND, title: &str) -> Option<String> {
     let mut buffer = vec![0u16; 32768];
     let filter = wide("应用程序 (*.exe)\0*.exe\0");
-    let title = wide("选择要排除的应用");
+    let title = wide(title);
     let mut dialog = OPENFILENAMEW {
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -76,7 +76,7 @@ pub unsafe fn pick(owner: HWND) {
         if err != 0 {
             label(RESULT, &format!("无法选择应用 ({err})"));
         }
-        return;
+        return None;
     }
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     let filename = String::from_utf16_lossy(&buffer[..len]);
@@ -86,14 +86,17 @@ pub unsafe fn pick(owner: HWND) {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     {
         label(RESULT, "请选择 .exe 程序文件");
-        return;
+        return None;
     }
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+    path.file_name()?.to_str().map(str::to_owned)
+}
+pub fn pick(owner: HWND) {
+    if let Some(name) = choose_executable(owner, "选择要排除的应用") {
         let (index, added) = DRAFT.with_borrow_mut(|names| {
-            if let Some(index) = names.iter().position(|s| s.eq_ignore_ascii_case(name)) {
+            if let Some(index) = names.iter().position(|s| s.eq_ignore_ascii_case(&name)) {
                 return (index, false);
             }
-            names.push(name.to_owned());
+            names.push(name);
             (names.len() - 1, true)
         });
         render(Some(index));

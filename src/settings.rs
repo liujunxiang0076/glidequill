@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::RwLock,
@@ -51,9 +52,60 @@ impl Default for Preferences {
         DEFAULTS
     }
 }
-static PREFS: RwLock<Preferences> = RwLock::new(DEFAULTS);
+pub type Bindings = [glidequill::Action; glidequill::GESTURES.len()];
+pub type Overrides = [Option<glidequill::Action>; glidequill::GESTURES.len()];
+pub type Applications = BTreeMap<String, Overrides>;
+
+#[derive(Default, Clone, Deserialize, Serialize)]
+struct Configuration {
+    #[serde(flatten)]
+    prefs: Preferences,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    applications: Applications,
+}
+static CONFIG: RwLock<Configuration> = RwLock::new(Configuration {
+    prefs: DEFAULTS,
+    applications: BTreeMap::new(),
+});
 pub fn preferences() -> Preferences {
-    *PREFS.read().unwrap()
+    CONFIG.read().unwrap().prefs
+}
+pub fn applications() -> Applications {
+    CONFIG.read().unwrap().applications.clone()
+}
+pub fn rule_changes(global: &Bindings, apps: &Applications) -> usize {
+    let saved = CONFIG.read().unwrap();
+    let mut count = global
+        .iter()
+        .zip(saved.prefs.bindings)
+        .filter(|(a, b)| **a != *b)
+        .count();
+    for (name, bindings) in apps {
+        let previous = saved.applications.get(name);
+        count += usize::from(previous.is_none());
+        count += bindings
+            .iter()
+            .zip(previous.unwrap_or(&[None; glidequill::GESTURES.len()]))
+            .filter(|(a, b)| a != b)
+            .count();
+    }
+    count
+        + saved
+            .applications
+            .keys()
+            .filter(|name| !apps.contains_key(*name))
+            .count()
+}
+pub fn bindings_for(exe: &str) -> Bindings {
+    let config = CONFIG.read().unwrap();
+    let global = config.prefs.bindings;
+    if config.applications.is_empty() {
+        return global;
+    }
+    match config.applications.get(&exe.to_lowercase()) {
+        Some(overrides) => std::array::from_fn(|i| overrides[i].unwrap_or(global[i])),
+        None => global,
+    }
 }
 pub fn excluded(exe: &str) -> bool {
     EXCLUDED
@@ -97,7 +149,8 @@ pub(super) fn load_from(dir: &Path) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let prefs = read::<Preferences>(&dir.join("settings.json"))?;
+    let config = read::<Configuration>(&dir.join("settings.json"))?;
+    let prefs = config.prefs;
     if !IDLE_VALUES.contains(&prefs.idle_ms) || !RESULT_VALUES.contains(&prefs.result_ms) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -105,7 +158,7 @@ pub(super) fn load_from(dir: &Path) -> io::Result<()> {
         ));
     }
     *EXCLUDED.write().unwrap() = exclusions;
-    *PREFS.write().unwrap() = prefs;
+    *CONFIG.write().unwrap() = config;
     Ok(())
 }
 // All writes originate on the settings window's thread; readers never wait for disk I/O.
@@ -116,7 +169,23 @@ fn write_json<T: Serialize + ?Sized>(dir: &Path, name: &str, value: &T) -> io::R
     fs::rename(temp, dir.join(name))
 }
 pub fn save(prefs: Preferences) -> io::Result<()> {
-    write_json(&directory()?, "settings.json", &prefs)?;
-    *PREFS.write().unwrap() = prefs;
+    persist(prefs, applications())
+}
+pub fn save_rules(bindings: Bindings, applications: Applications) -> io::Result<()> {
+    persist(
+        Preferences {
+            bindings,
+            ..preferences()
+        },
+        applications,
+    )
+}
+fn persist(prefs: Preferences, applications: Applications) -> io::Result<()> {
+    let config = Configuration {
+        prefs,
+        applications,
+    };
+    write_json(&directory()?, "settings.json", &config)?;
+    *CONFIG.write().unwrap() = config;
     Ok(())
 }

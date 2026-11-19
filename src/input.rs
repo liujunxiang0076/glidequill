@@ -43,7 +43,7 @@ pub fn initialize(window: HWND, pass_through: bool) {
     SETTINGS_WINDOW.with(|w| w.set(window));
     PASS_THROUGH.with(|v| v.set(pass_through));
 }
-unsafe fn eligible(point: POINT) -> Option<HWND> {
+unsafe fn eligible(point: POINT) -> Option<(HWND, settings::Bindings)> {
     unsafe {
         let target = GetAncestor(WindowFromPoint(point), GA_ROOT);
         if target.is_null() || target != GetForegroundWindow() {
@@ -80,7 +80,7 @@ unsafe fn eligible(point: POINT) -> Option<HWND> {
         }
         let path = String::from_utf16_lossy(&buf[..n as usize]);
         let exe = path.rsplit('\\').next()?;
-        (!settings::excluded(exe)).then_some(target)
+        (!settings::excluded(exe)).then(|| (target, settings::bindings_for(exe)))
     }
 }
 unsafe fn is_elevated(proc: HANDLE) -> bool {
@@ -270,7 +270,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
             WM_RBUTTONDOWN => {
                 if modifiers_pressed() || GetSystemMetrics(SM_SWAPBUTTON) != 0 {
                     false
-                } else if let Some(target) = eligible(point) {
+                } else if let Some((target, bindings)) = eligible(point) {
                     let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(target).max(96);
                     overlay::begin(SETTINGS_WINDOW.with(Cell::get), target, point, dpi);
                     CAPTURE.with(|c| {
@@ -278,7 +278,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             target,
                             started: GetTickCount(),
                             cancelled: false,
-                            bindings: settings::preferences().bindings,
+                            bindings,
                             origin: point,
                             dpi,
                             stroke: Stroke::new(0, 0),
@@ -414,20 +414,44 @@ mod tests {
             let test_dir =
                 std::env::temp_dir().join(format!("glidequill-bindings-{}", std::process::id()));
             std::fs::create_dir(&test_dir).unwrap();
-            std::fs::write(test_dir.join("settings.json"),r#"{"bindings":["back","forward","home","end","copy","paste","minimize","unassigned","end","unassigned","unassigned","unassigned","unassigned","copy","unassigned","unassigned"]}"#).unwrap();
+            let name = std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let mut overrides = [None; glidequill::GESTURES.len()];
+            overrides[4] = Some(glidequill::Action::Copy);
+            overrides[7] = Some(glidequill::Action::Unassigned);
+            let config = serde_json::json!({
+                "bindings": ["back", "forward", "home", "end", "home", "paste", "minimize", "end",
+                    "end", "unassigned", "unassigned", "unassigned", "unassigned", "copy", "unassigned", "unassigned"],
+                "applications": { (name.to_lowercase()): overrides }
+            });
+            std::fs::write(
+                test_dir.join("settings.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
             settings::load_from(&test_dir).unwrap();
-            let exe = std::env::current_exe().unwrap();
-            let name = exe.file_name().unwrap().to_string_lossy().to_uppercase();
+            assert_eq!(
+                settings::bindings_for("another.exe")[4],
+                glidequill::Action::Home
+            );
+            assert_eq!(
+                settings::bindings_for(&name.to_uppercase())[4],
+                glidequill::Action::Copy
+            );
             settings::save_exclusions_in(&test_dir, &[name]).unwrap();
             assert_eq!(
-                eligible(start),
+                eligible(start).map(|(target, _)| target),
                 None,
                 "saved exclusion must bypass the next stroke"
             );
             assert!(!gesture(WM_RBUTTONDOWN, start));
             assert!(!gesture(WM_RBUTTONUP, start));
             settings::save_exclusions_in(&test_dir, &[]).unwrap();
-            assert_eq!(eligible(start), Some(hwnd));
+            assert_eq!(eligible(start).map(|(target, _)| target), Some(hwnd));
             std::fs::remove_file(test_dir.join("excluded.json")).unwrap();
             std::fs::remove_file(test_dir.join("settings.json")).unwrap();
             std::fs::remove_dir(test_dir).unwrap();
@@ -458,7 +482,7 @@ mod tests {
             ] {
                 let end = POINT { x, y };
                 assert_eq!(
-                    eligible(start),
+                    eligible(start).map(|(target, _)| target),
                     Some(hwnd),
                     "hit={:?} foreground={:?}",
                     WindowFromPoint(start),
@@ -689,14 +713,14 @@ mod tests {
                 SWP_SHOWWINDOW,
             );
             assert_eq!(
-                eligible(start),
+                eligible(start).map(|(target, _)| target),
                 None,
                 "fullscreen must be bypassed by default"
             );
             std::fs::write(dir.join("settings.json"), r#"{"pause_fullscreen":false}"#).unwrap();
             settings::load_from(&dir).unwrap();
             assert_eq!(
-                eligible(start),
+                eligible(start).map(|(target, _)| target),
                 Some(hwnd),
                 "fullscreen opt-in must take effect"
             );

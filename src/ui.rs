@@ -594,6 +594,7 @@ fn control_bounds(id: i32) -> [i32; 4] {
             };
             [l.right - space - 94, y, 94, h]
         }
+        rules::SCOPE => [l.right - 295, 20, 170, 34],
         TOGGLE => [l.right - 113, 20, 113, 34],
         BASIC_TAB | RETURN_TAB | CORNER_TAB => {
             let (inset, gap, width, height) = if l.roomy {
@@ -686,6 +687,7 @@ fn controls() -> impl Iterator<Item = i32> {
         APP_LIST,
         DIRTY_RULES,
         GENERAL_SCROLL,
+        rules::SCOPE,
         TOGGLE,
         AUTOSTART,
         IDLE,
@@ -713,7 +715,7 @@ fn visible_on(id: i32, page: Page) -> bool {
         THEME_LIGHT | THEME_DARK | FULLSCREEN | EXCLUSIONS | AUTOSTART => false,
         IDLE | LINGER => page == Page::Feedback,
         ADD_APP | REMOVE_APP | SAVE_APPS | BACK | APP_LIST => page == Page::Exclusions,
-        DIRTY_RULES => page == Page::Rules,
+        DIRTY_RULES | rules::SCOPE => page == Page::Rules,
         TOGGLE => matches!(page, Page::Rules | Page::General),
         RESET_RULES | SAVE_RULES | BASIC_TAB | CORNER_TAB | RETURN_TAB => page == Page::Rules,
         id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
@@ -855,6 +857,7 @@ pub unsafe fn build() {
             (Page::Rules as i32, Page::Rules.title()),
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
+            (rules::SCOPE, "通用规则  ▾"),
             (BASIC_TAB, "基础方向"),
             (RETURN_TAB, "往返手势"),
             (CORNER_TAB, "转角手势"),
@@ -1115,9 +1118,8 @@ unsafe extern "system" fn interactive_control(
 }
 unsafe fn clear_target(w: HWND) -> Option<RECT> {
     unsafe {
-        if HOT_CONTROL.with(Cell::get) != w
-            || IsWindowEnabled(w) == 0
-            || SendMessageW(w, CB_GETCURSEL, 0, 0) <= Action::Unassigned as isize
+        if IsWindowEnabled(w) == 0
+            || SendMessageW(w, CB_GETCURSEL, 0, 0) == rules::clear_index() as isize
             || SendMessageW(w, CB_GETDROPPEDSTATE, 0, 0) != 0
         {
             return None;
@@ -1161,8 +1163,8 @@ unsafe extern "system" fn action_field(
                     ReleaseCapture();
                 }
                 if clear {
-                    SendMessageW(w, CB_SETCURSEL, Action::Unassigned as usize, 0);
-                    update_rule_buttons();
+                    SendMessageW(w, CB_SETCURSEL, rules::clear_index(), 0);
+                    rules::field_changed(GetDlgCtrlID(w));
                 }
                 InvalidateRect(w, null_mut(), 0);
                 return 0;
@@ -1211,7 +1213,7 @@ unsafe extern "system" fn action_field(
                 DT_CENTER,
             );
             r.left += px(9);
-            r.right = if let Some(clear) = clear_target(w) {
+            r.right = if hot && let Some(clear) = clear_target(w) {
                 if PRESSED_CLEAR.with(Cell::get) == w {
                     rounded(dc, inset(clear, px(3)), p.selected, 4);
                 }
@@ -1264,6 +1266,9 @@ pub unsafe fn paint(w: HWND) {
             0,
         );
         let description = match page {
+            Page::Rules if rules::is_application() => {
+                "跟随通用的手势会同步更新。选择「未绑定」可单独停用一个方向。"
+            }
             Page::Rules if ACTIVE_TAB.get() == RETURN_TAB => {
                 "按住右键连续回划，沿小弧线返回后松开。"
             }
@@ -1455,10 +1460,10 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         } else if (PICKER..PICKER + COUNT).contains(&id) {
             let selected = item.itemState & ODS_SELECTED != 0;
             fill(dc, r, if selected { p.selected } else { p.surface });
-            if let Some(a) = ACTIONS.get(item.itemID as usize) {
+            if let Some(name) = rules::option_label(id, item.itemID as usize) {
                 text(
                     dc,
-                    a.label(),
+                    &name,
                     RECT {
                         left: r.left + px(9),
                         ..r
@@ -1500,7 +1505,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             );
         } else if matches!(
             id,
-            RESET_RULES | SAVE_RULES | ADD_APP | REMOVE_APP | SAVE_APPS | BACK
+            RESET_RULES | SAVE_RULES | ADD_APP | REMOVE_APP | SAVE_APPS | BACK | rules::SCOPE
         ) {
             let enabled = IsWindowEnabled(item.hwndItem) != 0;
             let primary = enabled && matches!(id, SAVE_RULES | SAVE_APPS);
