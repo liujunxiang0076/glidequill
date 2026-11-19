@@ -1,11 +1,6 @@
 use crate::{overlay, settings};
 use glidequill::{Action, Stroke};
-use windows_sys::Win32::System::{
-    SystemInformation::GetTickCount,
-    SystemServices::{
-        APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD, APPCOMMAND_COPY, APPCOMMAND_PASTE,
-    },
-};
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK;
 
 use std::{
@@ -18,9 +13,20 @@ use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::Keyb
 
 struct Target {
     window: HWND,
-    browser: bool,
+    foreground: HWND,
+    pid: u32,
     bindings: settings::Bindings,
 }
+#[derive(Clone, Copy)]
+struct PendingShortcut {
+    target: HWND,
+    pid: u32,
+    requested: u32,
+    modifier: Option<u16>,
+    key: u16,
+}
+const ACTIVATION_TIMEOUT_MS: u32 = 350;
+
 struct Capture {
     target: Target,
     started: u32,
@@ -40,6 +46,7 @@ impl Capture {
 }
 thread_local! {
     static CAPTURE:RefCell<Option<Capture>>=const{RefCell::new(None)};
+    static PENDING: Cell<Option<PendingShortcut>> = const { Cell::new(None) };
     static SETTINGS_WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static PASS_THROUGH:Cell<bool>=const{Cell::new(false)};
 }
@@ -50,7 +57,14 @@ pub fn initialize(window: HWND, pass_through: bool) {
 unsafe fn eligible(point: POINT) -> Option<Target> {
     unsafe {
         let target = GetAncestor(WindowFromPoint(point), GA_ROOT);
-        if target.is_null() || target != GetForegroundWindow() {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null()
+            || target.is_null()
+            || target == GetDesktopWindow()
+            || target == GetShellWindow()
+            || IsWindowEnabled(target) == 0
+            || GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE != 0
+        {
             return None;
         }
         let mut mi = MONITORINFO {
@@ -88,8 +102,8 @@ unsafe fn eligible(point: POINT) -> Option<Target> {
         let exe = path.rsplit('\\').next()?;
         (!settings::excluded(exe)).then(|| Target {
             window: target,
-            browser: exe.eq_ignore_ascii_case("msedge.exe")
-                || exe.eq_ignore_ascii_case("chrome.exe"),
+            foreground,
+            pid,
             bindings: settings::bindings_for(exe),
         })
     }
@@ -124,10 +138,27 @@ pub unsafe extern "system" fn foreground_changed(
     _: u32,
     event_time: u32,
 ) {
+    // Foreground activation across input queues can complete after mouse-up.
+    if let Some(pending) = PENDING.get()
+        && event_time.wrapping_sub(pending.requested) as i32 >= 0
+    {
+        PENDING.set(None);
+        if hwnd == pending.target
+            && unsafe { GetTickCount() }.wrapping_sub(pending.requested) <= ACTIVATION_TIMEOUT_MS
+        {
+            let mut pid = 0;
+            unsafe {
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == pending.pid {
+                    send_shortcut(hwnd, pending.modifier, pending.key);
+                }
+            }
+        }
+    }
     CAPTURE.with_borrow_mut(|capture| {
         if let Some(s) = capture
             && !s.cancelled
-            && hwnd != s.target.window
+            && hwnd != s.target.foreground
             && event_time.wrapping_sub(s.started) as i32 >= 0
         {
             s.cancelled = true;
@@ -142,54 +173,6 @@ fn modifiers_pressed() -> bool {
     ]
     .iter()
     .any(|&key| unsafe { GetAsyncKeyState(key as i32) < 0 })
-}
-
-unsafe fn focused_control(target: HWND) -> Option<HWND> {
-    let mut gui = GUITHREADINFO {
-        cbSize: size_of::<GUITHREADINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        (GetGUIThreadInfo(0, &mut gui) != 0
-            && gui.hwndActive == target
-            && !gui.hwndFocus.is_null()
-            && GetAncestor(gui.hwndFocus, GA_ROOT) == target)
-            .then_some(gui.hwndFocus)
-    }
-}
-
-unsafe fn app_command(target: HWND, source: HWND, command: u32) {
-    unsafe {
-        PostMessageW(
-            target,
-            WM_APPCOMMAND,
-            source as usize,
-            ((FAPPCOMMAND_MOUSE | command) << 16) as isize,
-        );
-    }
-}
-
-// Edit controls accept direct selection commands. Other applications own the
-// clipboard formats and route the standard application command themselves.
-unsafe fn edit_command(target: HWND, focus: HWND, copy: bool) {
-    unsafe {
-        let mut name = [0u16; 128];
-        let len = GetClassNameW(focus, name.as_mut_ptr(), name.len() as i32);
-        let class = String::from_utf16_lossy(&name[..len as usize]).to_ascii_lowercase();
-        if class == "edit" || class.starts_with("richedit") {
-            PostMessageW(focus, if copy { WM_COPY } else { WM_PASTE }, 0, 0);
-        } else {
-            app_command(
-                target,
-                focus,
-                if copy {
-                    APPCOMMAND_COPY
-                } else {
-                    APPCOMMAND_PASTE
-                },
-            );
-        }
-    }
 }
 
 // Windows owns minimize/maximize placement even when an app draws its own caption.
@@ -234,10 +217,10 @@ unsafe fn close_window(target: HWND) {
     }
 }
 
-fn browser_shortcut(action: Action) -> Option<(Option<u16>, u16)> {
+fn shortcut(action: Action) -> Option<(Option<u16>, u16)> {
     match action {
-        Action::Back => Some((Some(VK_MENU), VK_LEFT)),
-        Action::Forward => Some((Some(VK_MENU), VK_RIGHT)),
+        Action::Back => Some((None, VK_BROWSER_BACK)),
+        Action::Forward => Some((None, VK_BROWSER_FORWARD)),
         Action::Home => Some((None, VK_HOME)),
         Action::End => Some((None, VK_END)),
         Action::Copy => Some((Some(VK_CONTROL), VK_C)),
@@ -264,7 +247,7 @@ fn key_event(key: u16, flags: u32) -> INPUT {
         },
     }
 }
-// Submit one complete shortcut to the browser's normal accelerator/focus routing.
+// Submit one complete shortcut to the active application's normal input queue.
 unsafe fn send_shortcut(target: HWND, modifier: Option<u16>, key: u16) {
     unsafe {
         let pair = [key_event(key, 0), key_event(key, KEYEVENTF_KEYUP)];
@@ -299,47 +282,39 @@ unsafe fn send_shortcut(target: HWND, modifier: Option<u16>, key: u16) {
         }
     }
 }
-unsafe fn execute(target: HWND, action: Action, browser: bool) {
+unsafe fn execute(target: HWND, action: Action) {
     unsafe {
-        if target != GetForegroundWindow() || modifiers_pressed() {
+        if modifiers_pressed() {
             return;
         }
-        if browser && let Some((modifier, key)) = browser_shortcut(action) {
+        let Some((modifier, key)) = shortcut(action) else {
+            match action {
+                Action::Minimize | Action::Maximize => change_window_state(target, action),
+                Action::Close => close_window(target),
+                _ => {}
+            }
+            return;
+        };
+        if GetForegroundWindow() == target {
             send_shortcut(target, modifier, key);
             return;
         }
-        match action {
-            Action::Unassigned => {}
-            Action::Back => app_command(target, target, APPCOMMAND_BROWSER_BACKWARD),
-            Action::Forward => app_command(target, target, APPCOMMAND_BROWSER_FORWARD),
-            Action::Copy | Action::Paste => {
-                if let Some(focus) = focused_control(target) {
-                    edit_command(target, focus, action == Action::Copy);
-                }
-            }
-            Action::Minimize | Action::Maximize => change_window_state(target, action),
-            Action::Close => close_window(target),
-            Action::Home | Action::End => {
-                let Some(focus) = focused_control(target) else {
-                    return;
-                };
-                let key = if action == Action::Home {
-                    VK_HOME
-                } else {
-                    VK_END
-                };
-                let scan = MapVirtualKeyW(key.into(), MAPVK_VK_TO_VSC);
-                let flags = 1 | ((scan & 0xff) << 16) | (1 << 24);
-                if PostMessageW(focus, WM_KEYDOWN, key as usize, flags as isize) != 0 {
-                    PostMessageW(
-                        focus,
-                        WM_KEYUP,
-                        key as usize,
-                        (flags | (3 << 30)) as i32 as isize,
-                    );
-                }
-            }
+
+        let mut pid = 0;
+        GetWindowThreadProcessId(target, &mut pid);
+        PENDING.set(Some(PendingShortcut {
+            target,
+            pid,
+            requested: GetTickCount(),
+            modifier,
+            key,
+        }));
+        if SetForegroundWindow(target) == 0 {
+            PENDING.set(None);
+        } else if GetForegroundWindow() == target && PENDING.take().is_some() {
+            send_shortcut(target, modifier, key);
         }
+        // Otherwise the foreground notification completes or cancels the shortcut.
     }
 }
 pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRESULT {
@@ -360,13 +335,29 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
 }
 unsafe fn gesture(msg: u32, point: POINT) -> bool {
     unsafe {
+        if matches!(
+            msg,
+            WM_RBUTTONDOWN
+                | WM_LBUTTONDOWN
+                | WM_MBUTTONDOWN
+                | WM_XBUTTONDOWN
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+        ) {
+            PENDING.set(None);
+        }
         match msg {
             WM_RBUTTONDOWN => {
                 if modifiers_pressed() || GetSystemMetrics(SM_SWAPBUTTON) != 0 {
                     false
                 } else if let Some(target) = eligible(point) {
                     let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(target.window).max(96);
-                    overlay::begin(SETTINGS_WINDOW.with(Cell::get), target.window, point, dpi);
+                    overlay::begin(
+                        SETTINGS_WINDOW.with(Cell::get),
+                        target.foreground,
+                        point,
+                        dpi,
+                    );
                     CAPTURE.with(|c| {
                         *c.borrow_mut() = Some(Capture {
                             target,
@@ -389,7 +380,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             return;
                         }
                         s.sample(point);
-                        if s.target.window != GetForegroundWindow() || modifiers_pressed() {
+                        if s.target.foreground != GetForegroundWindow() || modifiers_pressed() {
                             s.cancelled = true;
                             overlay::cancel(SETTINGS_WINDOW.with(Cell::get));
                         } else if !s.stroke.is_click() {
@@ -407,8 +398,13 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                 if let Some(mut s) = CAPTURE.with(|c| c.borrow_mut().take()) {
                     s.sample(point);
                     let window = SETTINGS_WINDOW.with(Cell::get);
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(s.target.window, &mut pid);
                     if s.cancelled
-                        || s.target.window != GetForegroundWindow()
+                        || pid != s.target.pid
+                        || IsWindowEnabled(s.target.window) == 0
+                        || IsIconic(s.target.window) != 0
+                        || s.target.foreground != GetForegroundWindow()
                         || modifiers_pressed()
                     {
                         overlay::cancel(window);
@@ -420,7 +416,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                     } else {
                         let action = s.stroke.gesture().map(|d| s.target.bindings[d as usize]);
                         if let Some(action) = overlay::finish(window, point, action) {
-                            execute(s.target.window, action, s.target.browser);
+                            execute(s.target.window, action);
                         }
                     }
                     true
@@ -462,6 +458,25 @@ mod tests {
             }
         }
         messages
+    }
+    fn keys(window: HWND, count: usize) -> Vec<(u16, bool)> {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        let mut result = Vec::new();
+        loop {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, window, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE) } != 0
+            {
+                match msg.message {
+                    WM_KEYDOWN | WM_SYSKEYDOWN => result.push((msg.wParam as u16, true)),
+                    WM_KEYUP | WM_SYSKEYUP => result.push((msg.wParam as u16, false)),
+                    _ => {}
+                }
+            }
+            if (count > 0 && result.len() >= count) || std::time::Instant::now() >= until {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
     // Runs on an interactive desktop. Feed physical-coordinate samples through the
     // production gesture handler without moving the user's pointer or injecting clicks.
@@ -625,37 +640,25 @@ mod tests {
                 assert!(received(hwnd, WM_KEYDOWN).is_empty());
                 assert!(gesture(WM_RBUTTONUP, end));
                 assert!(!gesture(WM_RBUTTONUP, end));
-                let commands = received(hwnd, WM_APPCOMMAND);
-                let downs = received(hwnd, WM_KEYDOWN);
-                let ups = received(hwnd, WM_KEYUP);
-                match expected {
-                    "后退" | "前进" | "复制" | "粘贴" => {
-                        let command = match expected {
-                            "后退" => APPCOMMAND_BROWSER_BACKWARD,
-                            "前进" => APPCOMMAND_BROWSER_FORWARD,
-                            "复制" => APPCOMMAND_COPY,
-                            _ => APPCOMMAND_PASTE,
-                        };
-                        assert_eq!(commands.len(), 1);
-                        assert_eq!(
-                            (commands[0].lParam as u32) >> 16,
-                            FAPPCOMMAND_MOUSE | command
-                        );
-                        assert!(downs.is_empty() && ups.is_empty());
-                    }
-                    "页面顶部" | "页面底部" => {
-                        let key = if expected == "页面顶部" {
-                            VK_HOME
-                        } else {
-                            VK_END
-                        };
-                        assert!(commands.is_empty());
-                        assert_eq!((downs.len(), ups.len()), (1, 1));
-                        assert_eq!(downs[0].wParam, key as usize);
-                        assert_eq!(ups[0].wParam, key as usize);
-                    }
-                    _ => assert!(commands.is_empty() && downs.is_empty() && ups.is_empty()),
-                }
+                let chord = |key| {
+                    vec![
+                        (VK_CONTROL, true),
+                        (key, true),
+                        (key, false),
+                        (VK_CONTROL, false),
+                    ]
+                };
+                let pair = |key| vec![(key, true), (key, false)];
+                let expected_keys = match expected {
+                    "后退" => pair(VK_BROWSER_BACK),
+                    "前进" => pair(VK_BROWSER_FORWARD),
+                    "复制" => chord(VK_C),
+                    "粘贴" => chord(VK_V),
+                    "页面顶部" => pair(VK_HOME),
+                    "页面底部" => pair(VK_END),
+                    _ => Vec::new(),
+                };
+                assert_eq!(keys(hwnd, expected_keys.len()), expected_keys);
                 overlay::refresh(hwnd);
                 let mut rect = RECT::default();
                 GetWindowRect(popup, &mut rect);
@@ -738,7 +741,7 @@ mod tests {
             ReleaseDC(null_mut(), screen);
             assert!(blended, "antialiased curve edge");
             assert!(gesture(WM_RBUTTONUP, POINT { x: 382, y: 245 }));
-            received(hwnd, WM_APPCOMMAND);
+            keys(hwnd, 0);
             // Even after returning to the starting window, a cancelled capture stays cancelled.
             assert!(gesture(WM_RBUTTONDOWN, start));
             foreground_changed(
@@ -756,7 +759,33 @@ mod tests {
             };
             gesture(WM_MOUSEMOVE, across);
             assert!(gesture(WM_RBUTTONUP, across));
-            assert!(received(hwnd, WM_APPCOMMAND).is_empty());
+            assert!(keys(hwnd, 0).is_empty());
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            let requested = GetTickCount();
+            PENDING.set(Some(PendingShortcut {
+                target: hwnd,
+                pid,
+                requested,
+                modifier: None,
+                key: VK_HOME,
+            }));
+            for activated in [GetDesktopWindow(), hwnd] {
+                foreground_changed(
+                    null_mut(),
+                    EVENT_SYSTEM_FOREGROUND,
+                    activated,
+                    0,
+                    0,
+                    0,
+                    requested,
+                );
+            }
+            assert!(PENDING.get().is_none());
+            assert!(
+                keys(hwnd, 0).is_empty(),
+                "cancelled activation must not send keys"
+            );
             // The held stroke expires independently of mouse-up, and cannot revive.
             let end = POINT { x: 380, y: 240 };
             assert!(gesture(WM_RBUTTONDOWN, start));
@@ -770,7 +799,7 @@ mod tests {
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
 
-            assert!(received(hwnd, WM_APPCOMMAND).is_empty());
+            assert!(keys(hwnd, 0).is_empty());
 
             // With idle cancellation disabled the same pause keeps the trail. Zero
             // release time must hide it on the first frame after release.
@@ -790,7 +819,10 @@ mod tests {
             assert!(gesture(WM_RBUTTONUP, end));
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
-            assert_eq!(received(hwnd, WM_APPCOMMAND).len(), 1);
+            assert_eq!(
+                keys(hwnd, 2),
+                [(VK_BROWSER_FORWARD, true), (VK_BROWSER_FORWARD, false)]
+            );
             let mut monitor = MONITORINFO {
                 cbSize: size_of::<MONITORINFO>() as u32,
                 ..Default::default()
@@ -843,9 +875,17 @@ mod tests {
             );
             assert!(!edit.is_null());
             SetFocus(edit);
-            for (action, message) in [(Action::Copy, WM_COPY), (Action::Paste, WM_PASTE)] {
-                execute(hwnd, action, false);
-                assert_eq!(received(edit, message).len(), 1);
+            for (action, key) in [(Action::Copy, VK_C), (Action::Paste, VK_V)] {
+                execute(hwnd, action);
+                assert_eq!(
+                    keys(edit, 4),
+                    [
+                        (VK_CONTROL, true),
+                        (key, true),
+                        (key, false),
+                        (VK_CONTROL, false)
+                    ]
+                );
                 assert!(received(hwnd, WM_APPCOMMAND).is_empty());
             }
             DestroyWindow(edit);
@@ -867,11 +907,11 @@ mod tests {
             SetForegroundWindow(sample);
             let menu = GetSystemMenu(sample, 0);
             EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_GRAYED);
-            execute(sample, Action::Minimize, false);
+            execute(sample, Action::Minimize);
             let mut msg = MSG::default();
             PeekMessageW(&mut msg, sample, 0, 0, PM_NOREMOVE);
             assert_eq!(IsIconic(sample), 0, "explicitly disabled minimize");
-            execute(sample, Action::Close, false);
+            execute(sample, Action::Close);
             let messages = received(sample, WM_SYSCOMMAND);
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].wParam, SC_CLOSE as usize);

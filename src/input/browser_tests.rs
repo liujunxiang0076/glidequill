@@ -12,7 +12,7 @@ fn title(window: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 // Keep the same layered windows visible during dispatch as on the interactive desktop.
-struct FeedbackWindow(HWND);
+struct FeedbackWindow(HWND, HWINEVENTHOOK);
 impl FeedbackWindow {
     fn new() -> Self {
         unsafe {
@@ -34,13 +34,25 @@ impl FeedbackWindow {
             crate::WINDOW.set(host);
             initialize(host, false);
             overlay::create().unwrap();
-            Self(host)
+            use windows_sys::Win32::UI::Accessibility::SetWinEventHook;
+            let focus_hook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                null_mut(),
+                Some(foreground_changed),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            assert!(!focus_hook.is_null());
+            Self(host, focus_hook)
         }
     }
 }
 impl Drop for FeedbackWindow {
     fn drop(&mut self) {
         unsafe {
+            windows_sys::Win32::UI::Accessibility::UnhookWinEvent(self.1);
             overlay::destroy();
             DestroyWindow(self.0);
         }
@@ -53,14 +65,17 @@ struct Browser {
     window: HWND,
 }
 impl Browser {
-    fn start() -> Self {
+    fn start(profile: &str) -> Self {
         let chrome = std::env::var_os("GLIDEQUILL_TEST_BROWSER")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("ProgramFiles").unwrap())
                     .join("Google/Chrome/Application/chrome.exe")
             });
-        let dir = std::env::temp_dir().join(format!("glidequill-browser-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "glidequill-browser-{profile}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir(&dir).unwrap();
         let page = dir.join("test.html");
         std::fs::write(
@@ -150,6 +165,14 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
         let wanted = format!("GlideQuill action test {state}");
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(3) {
+            // Out-of-context foreground events are delivered to the installing thread.
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
             if title(self.window).contains(&wanted) {
                 return;
             }
@@ -159,7 +182,11 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
     }
     fn swipe(&self, dx: i32, dy: i32) {
         self.activate();
+        self.swipe_with_foreground(dx, dy, self.window);
+    }
+    fn swipe_with_foreground(&self, dx: i32, dy: i32, foreground: HWND) {
         unsafe {
+            assert_eq!(GetForegroundWindow(), foreground);
             let mut rect = RECT::default();
             assert_ne!(GetWindowRect(self.window, &mut rect), 0);
             let center = POINT {
@@ -172,6 +199,7 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            assert_eq!(GetAncestor(WindowFromPoint(center), GA_ROOT), self.window);
             let end = POINT {
                 x: center.x + dx,
                 y: center.y + dy,
@@ -193,8 +221,8 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
             );
             assert_eq!(
                 GetForegroundWindow(),
-                self.window,
-                "feedback took browser focus"
+                foreground,
+                "feedback changed focus before release"
             );
             assert!(gesture(WM_RBUTTONUP, end));
             overlay::refresh(crate::app_window());
@@ -235,7 +263,7 @@ fn external_browser_actions() {
     }
     let _graphics = crate::ui::GraphicsSession::start();
     let _feedback = FeedbackWindow::new();
-    let browser = Browser::start();
+    let browser = Browser::start("target");
     let mut bindings = glidequill::DEFAULT_BINDINGS;
     bindings[glidequill::Gesture::DownLeft as usize] = Action::Minimize;
     bindings[glidequill::Gesture::UpRight as usize] = Action::Maximize;
@@ -277,6 +305,27 @@ fn external_browser_actions() {
             browser.swipe(dx, dy);
             browser.expect_page(state);
         }
+        // A second process owns the foreground while the origin remains visible.
+        // Navigation must activate only the browser under the pointer.
+        let other = Browser::start("foreground");
+        let mut rect = RECT::default();
+        GetWindowRect(browser.window, &mut rect);
+        let mid_x = (rect.left + rect.right) / 2;
+        SetWindowPos(
+            other.window,
+            HWND_TOP,
+            mid_x - 610,
+            rect.top,
+            500,
+            320,
+            SWP_SHOWWINDOW,
+        );
+        browser.activate();
+        other.activate();
+        browser.swipe_with_foreground(-120, 0, other.window);
+        browser.expect_page("index-top");
+        assert_eq!(GetForegroundWindow(), browser.window);
+        other.expect_page("index-top");
         // Verify a standard frame first, then the same external window with the
         // custom frame flags observed on QcClip (minimize box, no system menu).
         for custom_frame in [false, true] {
@@ -336,11 +385,13 @@ fn external_browser_actions() {
                 (restored.left, restored.top, restored.right, restored.bottom),
                 (normal.left, normal.top, normal.right, normal.bottom)
             );
-            browser.swipe(-120, 120);
+            other.activate();
+            browser.swipe_with_foreground(-120, 120, other.window);
             let start = Instant::now();
             while IsIconic(browser.window) == 0 && start.elapsed() < Duration::from_secs(2) {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            assert_eq!(IsIconic(other.window), 0);
             assert_ne!(
                 IsIconic(browser.window),
                 0,

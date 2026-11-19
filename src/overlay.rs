@@ -16,7 +16,7 @@ const MAX_POINTS: usize = 512;
 // frame per timer tick. No bitmap allocation or painting takes place in the hook.
 #[derive(Default)]
 struct Trail {
-    target: usize,
+    foreground: usize,
     dpi: u32,
     points: Vec<POINT>,
     visible: bool,
@@ -26,7 +26,7 @@ struct Trail {
     expires: Option<Instant>,
 }
 static TRAIL: Mutex<Trail> = Mutex::new(Trail {
-    target: 0,
+    foreground: 0,
     dpi: 96,
     points: Vec::new(),
     visible: false,
@@ -54,12 +54,12 @@ fn notify(window: HWND) {
         PostMessageW(window, REFRESH, 0, 0);
     }
 }
-pub fn begin(window: HWND, target: HWND, origin: POINT, dpi: u32) {
+pub fn begin(window: HWND, foreground: HWND, origin: POINT, dpi: u32) {
     let mut state = TRAIL.lock().unwrap();
     let previous = state.visible;
     state.points.clear();
     state.points.push(origin);
-    state.target = target as usize;
+    state.foreground = foreground as usize;
     state.dpi = dpi;
     state.visible = false;
     state.dirty = true;
@@ -86,7 +86,7 @@ fn append(points: &mut Vec<POINT>, pt: POINT) {
 }
 pub fn extend(window: HWND, pt: POINT, action: Option<Action>) {
     let mut state = TRAIL.lock().unwrap();
-    if state.target == 0 {
+    if state.foreground == 0 {
         return;
     }
     let now = Instant::now();
@@ -112,7 +112,7 @@ pub fn extend(window: HWND, pt: POINT, action: Option<Action>) {
 }
 pub fn finish(window: HWND, pt: POINT, action: Option<Action>) -> Option<Action> {
     let mut state = TRAIL.lock().unwrap();
-    if state.target == 0 {
+    if state.foreground == 0 {
         return None;
     }
     let now = Instant::now();
@@ -228,7 +228,7 @@ pub unsafe fn refresh(window: HWND) {
         let popup = POPUP.with(Cell::get);
         let mut state = TRAIL.lock().unwrap();
         if !state.visible
-            || state.target != GetForegroundWindow() as usize
+            || (state.expires.is_none() && state.foreground != GetForegroundWindow() as usize)
             || state.idle_deadline.is_some_and(|t| Instant::now() >= t)
             || state.expires.is_some_and(|t| Instant::now() >= t)
         {
