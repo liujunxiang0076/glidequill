@@ -1,6 +1,6 @@
-use crate::settings;
-use glidequill::{Action, DIRECTIONS, Stroke};
-use std::time::{Duration, Instant};
+use crate::{overlay, settings};
+use glidequill::Stroke;
+
 use std::{
     cell::{Cell, RefCell},
     mem::size_of,
@@ -11,38 +11,32 @@ use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::Keyb
 
 struct Capture {
     target: HWND,
-    actions: [Action; 4],
+    origin: POINT,
+    dpi: u32,
     stroke: Stroke,
-    last: Instant,
-    expired: bool,
 }
-thread_local! {static CAPTURE:RefCell<Option<Capture>>=const{RefCell::new(None)};}
-pub const DISPATCH: u32 = WM_APP + 1;
+impl Capture {
+    fn sample(&mut self, point: POINT) {
+        let scale = 96.0 / self.dpi as f64;
+        self.stroke.sample(
+            ((point.x - self.origin.x) as f64 * scale).round() as i32,
+            ((point.y - self.origin.y) as f64 * scale).round() as i32,
+        );
+    }
+}
 thread_local! {
+    static CAPTURE:RefCell<Option<Capture>>=const{RefCell::new(None)};
     static SETTINGS_WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static PASS_THROUGH:Cell<bool>=const{Cell::new(false)};
-    static PENDING:RefCell<std::collections::VecDeque<(HWND,Action)>>=const{RefCell::new(std::collections::VecDeque::new())};
 }
 pub fn initialize(window: HWND, pass_through: bool) {
     SETTINGS_WINDOW.with(|w| w.set(window));
     PASS_THROUGH.with(|v| v.set(pass_through));
 }
-pub fn dispatch_pending() {
-    if let Some((target, action)) = PENDING.with(|q| q.borrow_mut().pop_front()) {
-        unsafe {
-            if target == GetForegroundWindow() {
-                perform(target, action)
-            }
-        }
-    }
-}
-unsafe fn eligible(point: POINT) -> Option<(HWND, [Action; 4])> {
+unsafe fn eligible(point: POINT) -> Option<HWND> {
     unsafe {
         let target = GetAncestor(WindowFromPoint(point), GA_ROOT);
-        if target.is_null()
-            || target != GetForegroundWindow()
-            || target == SETTINGS_WINDOW.with(Cell::get)
-        {
+        if target.is_null() || target != GetForegroundWindow() {
             return None;
         }
         let mut mi = MONITORINFO {
@@ -75,14 +69,7 @@ unsafe fn eligible(point: POINT) -> Option<(HWND, [Action; 4])> {
         }
         let path = String::from_utf16_lossy(&buf[..n as usize]);
         let exe = path.rsplit('\\').next()?;
-        let br = glidequill::browser(exe);
-        let c = settings::snapshot();
-        let actions = DIRECTIONS.map(|d| c.resolve(br, d));
-        let skip = c.excluded.iter().any(|s| s.eq_ignore_ascii_case(exe))
-            || actions
-                .iter()
-                .all(|a| matches!(a, Action::Off | Action::Inherit));
-        (!skip).then_some((target, actions))
+        (!settings::excluded(exe)).then_some(target)
     }
 }
 unsafe fn is_elevated(proc: HANDLE) -> bool {
@@ -114,7 +101,16 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
         if e.flags & LLMHF_INJECTED != 0 {
             return CallNextHookEx(null_mut(), code, msg, data);
         }
-        let swallowed = match msg as u32 {
+        if gesture(msg as u32, e.pt) {
+            1
+        } else {
+            CallNextHookEx(null_mut(), code, msg, data)
+        }
+    }
+}
+unsafe fn gesture(msg: u32, point: POINT) -> bool {
+    unsafe {
+        match msg {
             WM_RBUTTONDOWN => {
                 if [
                     VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_LBUTTON, VK_MBUTTON,
@@ -124,14 +120,15 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
                     || GetSystemMetrics(SM_SWAPBUTTON) != 0
                 {
                     false
-                } else if let Some((target, actions)) = eligible(e.pt) {
+                } else if let Some(target) = eligible(point) {
+                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(target).max(96);
+                    overlay::begin(SETTINGS_WINDOW.with(Cell::get), target, point, dpi);
                     CAPTURE.with(|c| {
                         *c.borrow_mut() = Some(Capture {
                             target,
-                            actions,
-                            stroke: Stroke::new(e.pt.x, e.pt.y),
-                            last: Instant::now(),
-                            expired: false,
+                            origin: point,
+                            dpi,
+                            stroke: Stroke::new(0, 0),
                         })
                     });
                     true
@@ -142,32 +139,29 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
             WM_MOUSEMOVE => {
                 CAPTURE.with(|c| {
                     if let Some(s) = c.borrow_mut().as_mut() {
-                        s.expired |= s.last.elapsed() > Duration::from_millis(750);
-                        s.last = Instant::now();
-                        s.stroke.sample(e.pt.x, e.pt.y);
+                        s.sample(point);
+                        if s.target != GetForegroundWindow() {
+                            overlay::cancel(SETTINGS_WINDOW.with(Cell::get));
+                        } else if !s.stroke.is_click() {
+                            overlay::extend(SETTINGS_WINDOW.with(Cell::get), point);
+                        }
                     }
                 });
                 false
             }
             WM_RBUTTONUP => {
                 if let Some(mut s) = CAPTURE.with(|c| c.borrow_mut().take()) {
-                    s.stroke.sample(e.pt.x, e.pt.y);
-                    if s.target == GetForegroundWindow() {
-                        if s.stroke.is_click() {
-                            if GetAncestor(WindowFromPoint(e.pt), GA_ROOT) == s.target {
-                                replay_click();
-                            }
-                        } else if !s.expired
-                            && s.last.elapsed() <= Duration::from_millis(750)
-                            && let Some(d) = s.stroke.direction()
-                        {
-                            // Defer input injection until the low-level hook returns.
-                            if PostThreadMessageW(GetCurrentThreadId(), DISPATCH, 0, 0) != 0 {
-                                PENDING.with(|q| {
-                                    q.borrow_mut().push_back((s.target, s.actions[d as usize]))
-                                });
-                            }
+                    s.sample(point);
+                    let window = SETTINGS_WINDOW.with(Cell::get);
+                    if s.target != GetForegroundWindow() {
+                        overlay::cancel(window);
+                    } else if s.stroke.is_click() {
+                        overlay::cancel(window);
+                        if GetAncestor(WindowFromPoint(point), GA_ROOT) == s.target {
+                            replay_click();
                         }
+                    } else {
+                        overlay::finish(window, point, s.stroke.direction());
                     }
                     true
                 } else {
@@ -175,11 +169,6 @@ pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRES
                 }
             }
             _ => false,
-        };
-        if swallowed {
-            1
-        } else {
-            CallNextHookEx(null_mut(), code, msg, data)
         }
     }
 }
@@ -197,53 +186,92 @@ unsafe fn replay_click() {
         SendInput(2, batch.as_ptr(), size_of::<INPUT>() as i32);
     }
 }
-unsafe fn perform(target: HWND, a: Action) {
-    unsafe {
-        let system_command = match a {
-            Action::Minimize => Some(SC_MINIMIZE),
-            Action::Maximize => Some(if IsZoomed(target) != 0 {
-                SC_RESTORE
-            } else {
-                SC_MAXIMIZE
-            }),
-            Action::Close => Some(SC_CLOSE),
-            _ => None,
-        };
-        if let Some(command) = system_command {
-            PostMessageW(target, WM_SYSCOMMAND, command as usize, 0);
-            return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ui, wide};
+    // Runs on an interactive desktop. Feed physical-coordinate samples through the
+    // production gesture handler without moving the user's pointer or injecting clicks.
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn native_trail_shows_before_release_and_preserves_the_foreground() {
+        unsafe {
+            use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+            use windows_sys::Win32::UI::HiDpi::*;
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let _graphics = ui::GraphicsSession::start();
+            let class = wide("GlideQuill.SmokeSurface");
+            let instance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null_mut());
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                lpszClassName: class.as_ptr(),
+                hInstance: instance,
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&wc), 0);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                class.as_ptr(),
+                wide("GlideQuill overlay test").as_ptr(),
+                WS_POPUP | WS_VISIBLE,
+                80,
+                80,
+                480,
+                360,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            assert!(!hwnd.is_null());
+            SetForegroundWindow(hwnd);
+            assert_eq!(GetForegroundWindow(), hwnd);
+            crate::WINDOW.with(|v| v.set(hwnd));
+            initialize(hwnd, false);
+            overlay::create().unwrap();
+            let popup = overlay::test_popup();
+            assert!(!popup.is_null());
+            UpdateWindow(hwnd);
+            DwmFlush();
+            let start = POINT { x: 280, y: 240 };
+            for (x, y) in [(180, 240), (380, 240), (280, 140), (280, 340), (370, 330)] {
+                let end = POINT { x, y };
+                assert_eq!(
+                    eligible(start),
+                    Some(hwnd),
+                    "hit={:?} foreground={:?}",
+                    WindowFromPoint(start),
+                    GetForegroundWindow()
+                );
+                assert!(gesture(WM_RBUTTONDOWN, start));
+                overlay::refresh(hwnd);
+                assert_eq!(IsWindowVisible(popup), 0);
+                assert!(!gesture(WM_MOUSEMOVE, end));
+                overlay::refresh(hwnd);
+                assert_ne!(IsWindowVisible(popup), 0);
+                DwmFlush();
+                let screen = GetDC(null_mut());
+                let color = GetPixel(screen, (x + start.x) / 2, (y + start.y) / 2);
+                ReleaseDC(null_mut(), screen);
+                assert_eq!(color, 0xd36838, "live stroke at screen midpoint");
+                assert_eq!(GetForegroundWindow(), hwnd);
+                assert_eq!(GetAncestor(WindowFromPoint(end), GA_ROOT), hwnd);
+                assert!(gesture(WM_RBUTTONUP, end));
+                overlay::refresh(hwnd);
+                let mut rect = RECT::default();
+                GetWindowRect(popup, &mut rect);
+                assert!(
+                    rect.right > end.x + 50,
+                    "result badge extends beyond endpoint"
+                );
+                assert_eq!(GetForegroundWindow(), hwnd);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            overlay::refresh(hwnd);
+            assert_eq!(IsWindowVisible(popup), 0);
+            overlay::destroy();
+            DestroyWindow(hwnd);
         }
-        let (modifier, key) = match a {
-            Action::Back => (VK_MENU, VK_LEFT),
-            Action::Forward => (VK_MENU, VK_RIGHT),
-            Action::Copy => (VK_CONTROL, 0x43),
-            Action::Paste => (VK_CONTROL, 0x56),
-            Action::Home => (VK_CONTROL, VK_HOME),
-            Action::End => (VK_CONTROL, VK_END),
-            _ => return,
-        };
-        if [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
-            .iter()
-            .any(|&k| GetAsyncKeyState(k as i32) < 0)
-        {
-            return;
-        }
-        let batch = [
-            (modifier, 0),
-            (key, 0),
-            (key, KEYEVENTF_KEYUP),
-            (modifier, KEYEVENTF_KEYUP),
-        ]
-        .map(|(k, f)| INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: k,
-                    dwFlags: f,
-                    ..Default::default()
-                },
-            },
-        });
-        SendInput(4, batch.as_ptr(), size_of::<INPUT>() as i32);
     }
 }

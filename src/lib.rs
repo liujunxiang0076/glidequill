@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Left,
@@ -15,64 +13,15 @@ pub const DIRECTIONS: [Direction; 4] = [
     Direction::Down,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Action {
-    Inherit,
-    Off,
-    Back,
-    Forward,
-    Copy,
-    Paste,
-    Home,
-    End,
-    Minimize,
-    Maximize,
-    Close,
-}
-pub const ACTIONS: [(Action, &str); 11] = [
-    (Action::Inherit, "沿用通用"),
-    (Action::Off, "停用"),
-    (Action::Back, "后退"),
-    (Action::Forward, "前进"),
-    (Action::Copy, "复制"),
-    (Action::Paste, "粘贴"),
-    (Action::Home, "页面顶部"),
-    (Action::End, "页面底部"),
-    (Action::Minimize, "最小化窗口"),
-    (Action::Maximize, "最大化／还原"),
-    (Action::Close, "关闭当前窗口"),
-];
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Config {
-    pub global: [Action; 4],
-    pub browser: [Action; 4],
-    #[serde(default)]
-    pub excluded: Vec<String>,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            global: [Action::Back, Action::Forward, Action::Off, Action::Off],
-            browser: [Action::Inherit; 4],
-            excluded: vec![],
+impl Direction {
+    pub const fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Left => ("向左划", "后退"),
+            Self::Right => ("向右划", "前进"),
+            Self::Up => ("向上划", "页面顶部"),
+            Self::Down => ("向下划", "页面底部"),
         }
     }
-}
-impl Config {
-    pub fn resolve(&self, browser: bool, dir: Direction) -> Action {
-        let i = dir as usize;
-        if browser && self.browser[i] != Action::Inherit {
-            self.browser[i]
-        } else {
-            self.global[i]
-        }
-    }
-}
-pub fn browser(exe: &str) -> bool {
-    ["chrome.exe", "msedge.exe", "firefox.exe"]
-        .iter()
-        .any(|s| exe.eq_ignore_ascii_case(s))
 }
 /// Track distance as well as displacement so loops cannot turn into accidental swipes.
 #[derive(Default)]
@@ -125,6 +74,19 @@ impl Stroke {
 mod tests {
     use super::*;
     #[test]
+    fn four_fixed_directions_match_their_preview() {
+        for (x, y, label) in [
+            (-60, 0, "后退"),
+            (60, 0, "前进"),
+            (0, -60, "页面顶部"),
+            (0, 60, "页面底部"),
+        ] {
+            let mut stroke = Stroke::new(0, 0);
+            stroke.sample(x, y);
+            assert_eq!(stroke.direction().map(|d| d.labels().1), Some(label));
+        }
+    }
+    #[test]
     fn reject_jitter_diagonal_and_loops() {
         for pts in [vec![(3, 2)], vec![(60, 60)], vec![(80, 0), (0, 0), (30, 0)]] {
             let mut s = Stroke::new(0, 0);
@@ -147,20 +109,5 @@ mod tests {
         s.sample(70, 0);
         s.sample(0, 0);
         assert!(!s.is_click());
-    }
-    #[test]
-    fn explicit_off_overrides_global() {
-        let mut c = Config::default();
-        assert_eq!(c.resolve(true, Direction::Left), Action::Back);
-        c.browser[0] = Action::Off;
-        assert_eq!(c.resolve(true, Direction::Left), Action::Off);
-        assert_eq!(c.resolve(false, Direction::Left), Action::Back)
-    }
-    #[test]
-    fn config_roundtrip() {
-        let c: Config =
-            serde_json::from_str(&serde_json::to_string(&Config::default()).unwrap()).unwrap();
-        assert!(browser("CHROME.EXE"));
-        assert_eq!(c.global, Config::default().global);
     }
 }

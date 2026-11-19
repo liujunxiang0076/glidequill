@@ -81,12 +81,8 @@ unsafe fn pump(stop: HANDLE) {
                 if msg.message == WM_QUIT {
                     return;
                 }
-                if msg.message == input::DISPATCH && msg.hwnd.is_null() {
-                    input::dispatch_pending();
-                } else {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
         }
     }

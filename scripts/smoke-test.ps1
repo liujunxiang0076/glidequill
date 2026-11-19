@@ -76,13 +76,21 @@ function Start-TestApp {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     throw 'Missing native window'
 }
+$legacyDir = Join-Path $root 'GlideQuill'
+[void][IO.Directory]::CreateDirectory($legacyDir)
+$legacyFile = Join-Path $legacyDir 'rules.json'
+$legacy = '{"global":["Close","Minimize","Paste","Copy"],"browser":["Home","End","Off","Off"],"excluded":["blocked.exe"]}'
+[IO.File]::WriteAllText($legacyFile,$legacy)
 $p = Start-TestApp
 try {
     $w=$p.MainWindowHandle
     Require ((Get-Label $w 121) -eq '启用全局手势') 'Unexpected startup hook state'
     Require ([GestureSmoke]::AreDpiAwarenessContextsEqual([GestureSmoke]::GetWindowDpiAwarenessContext($w), [IntPtr](-4))) 'Window must render at per-monitor DPI v2'
-    $save=[GestureSmoke]::GetDlgItem($w,120)
-    Require (![GestureSmoke]::IsWindowEnabled($save)) 'Unchanged rules marked dirty'
+    $expected = @('向左划 · 后退','向右划 · 前进','向上划 · 页面顶部','向下划 · 页面底部')
+    foreach ($i in 0..3) { Require ((Get-Label $w (140+$i)) -eq $expected[$i]) 'Wrong preset' }
+    foreach ($id in @(110,120,125,126)) {
+        Require ([GestureSmoke]::GetDlgItem($w,$id) -eq [IntPtr]::Zero) 'Obsolete editor control'
+    }
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
     Save-Screenshot $w 'windows-light.png'
     # The isolated instance installs the real hook but always forwards mouse events.
@@ -93,20 +101,6 @@ try {
         Require ((Get-Label $w 121) -eq '启用全局手势') 'Listener did not stop'
     }
     [void](Send $w 0x111 121)
-    $pad=[GestureSmoke]::GetDlgItem($w,125)
-    [void](Send $pad 0x204 2 (30*65536+120))
-    [void](Send $pad 0x200 2 (30*65536+55))
-    [void](Send $pad 0x205 0 (30*65536+30))
-    Require ((Get-Label $w 122) -like '*向左*后退*') 'Practice recognition failed'
-    [void](Send $w 0x111 126)
-    $up=[GestureSmoke]::GetDlgItem($w,112)
-    [void](Send $up 0x14e 6)
-    [void](Send $w 0x111 (65536+112) $up)
-    Require ([GestureSmoke]::IsWindowEnabled($save)) 'Changed rules cannot be saved'
-    [void](Send $w 0x111 120)
-    Require (![GestureSmoke]::IsWindowEnabled($save)) 'Saved rules still marked dirty'
-    $cfg=Get-Content (Join-Path $root 'GlideQuill/rules.json') -Encoding utf8 -Raw | ConvertFrom-Json
-    Require ($cfg.browser[2] -eq 'Home') 'Save failed'
     [void](Send $w 0x111 127)
     Require ((Get-Label $w 127) -eq '浅色') 'Theme failed'
     Save-Screenshot $w 'windows-dark.png'
@@ -120,14 +114,8 @@ try {
     Require ([GestureSmoke]::IsWindowVisible($w)) 'Reopen failed'
     [void](Send $w 0x111 124)
     Require ($p.WaitForExit(5000)) 'Tray exit failed'
-    $p=Start-TestApp
-    $w=$p.MainWindowHandle
-    [void](Send $w 0x111 126)
-    $up=[GestureSmoke]::GetDlgItem($w,112)
-    Require ((Send $up 0x147).ToInt32() -eq 6) 'Reload failed'
-    [void](Send $w 0x111 124)
-    Require ($p.WaitForExit(5000)) 'Final exit failed'
-    Write-Output 'PASS: startup, practice, browser override, save/reload, theme, tray, single-instance reopen and exit.'
+    Require ((Get-Content -Raw -LiteralPath $legacyFile) -ceq $legacy) 'Legacy rules changed'
+    Write-Output 'PASS: four read-only rules, preview switch, theme, tray, single-instance and legacy config preservation.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     $tempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
