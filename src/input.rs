@@ -143,7 +143,11 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                         if s.target != GetForegroundWindow() {
                             overlay::cancel(SETTINGS_WINDOW.with(Cell::get));
                         } else if !s.stroke.is_click() {
-                            overlay::extend(SETTINGS_WINDOW.with(Cell::get), point);
+                            overlay::extend(
+                                SETTINGS_WINDOW.with(Cell::get),
+                                point,
+                                s.stroke.direction(),
+                            );
                         }
                     }
                 });
@@ -234,8 +238,15 @@ mod tests {
             assert!(!popup.is_null());
             UpdateWindow(hwnd);
             DwmFlush();
+            let subtitle = overlay::test_subtitle();
             let start = POINT { x: 280, y: 240 };
-            for (x, y) in [(180, 240), (380, 240), (280, 140), (280, 340), (370, 330)] {
+            for (x, y, expected) in [
+                (180, 240, "后退"),
+                (380, 240, "前进"),
+                (280, 140, "页面顶部"),
+                (280, 340, "页面底部"),
+                (370, 330, ""),
+            ] {
                 let end = POINT { x, y };
                 assert_eq!(
                     eligible(start),
@@ -255,21 +266,65 @@ mod tests {
                 let color = GetPixel(screen, (x + start.x) / 2, (y + start.y) / 2);
                 ReleaseDC(null_mut(), screen);
                 assert_eq!(color, 0xd36838, "live stroke at screen midpoint");
+                let matched = !expected.is_empty();
+                assert_eq!(IsWindowVisible(subtitle) != 0, matched);
+                if matched {
+                    let mut buf = [0u16; 32];
+                    let n = GetWindowTextW(subtitle, buf.as_mut_ptr(), 32);
+                    assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), expected);
+                    let mut rect = RECT::default();
+                    GetWindowRect(subtitle, &mut rect);
+                    let mut m = MONITORINFO {
+                        cbSize: size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    assert_ne!(
+                        GetMonitorInfoW(MonitorFromPoint(end, MONITOR_DEFAULTTONEAREST), &mut m),
+                        0
+                    );
+                    let work = m.rcWork;
+                    assert!((rect.left + rect.right - work.left - work.right).abs() <= 1);
+                    assert!(rect.top > (work.top + work.bottom) / 2 && rect.bottom <= work.bottom);
+                }
                 assert_eq!(GetForegroundWindow(), hwnd);
                 assert_eq!(GetAncestor(WindowFromPoint(end), GA_ROOT), hwnd);
                 assert!(gesture(WM_RBUTTONUP, end));
                 overlay::refresh(hwnd);
                 let mut rect = RECT::default();
                 GetWindowRect(popup, &mut rect);
-                assert!(
-                    rect.right > end.x + 50,
-                    "result badge extends beyond endpoint"
-                );
+                assert_eq!(IsWindowVisible(subtitle) != 0, matched);
+                if matched {
+                    assert!(
+                        rect.right <= start.x.max(end.x) + 16,
+                        "stroke surface grew to subtitle"
+                    );
+                }
                 assert_eq!(GetForegroundWindow(), hwnd);
             }
             std::thread::sleep(std::time::Duration::from_millis(600));
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
+            assert_eq!(IsWindowVisible(subtitle), 0);
+            // A diagonal entering a bend must have intermediate edge pixels,
+            // not a staircase made entirely of solid ink and background.
+            assert!(gesture(WM_RBUTTONDOWN, start));
+            for (x, y) in [(315, 221), (336, 224), (361, 237), (382, 245)] {
+                gesture(WM_MOUSEMOVE, POINT { x, y });
+            }
+            overlay::refresh(hwnd);
+            DwmFlush();
+            let screen = GetDC(null_mut());
+            let mut blended = false;
+            for y in 224..237 {
+                for x in 294..303 {
+                    let c = GetPixel(screen, x, y);
+                    let (r, g, b) = (c & 255, (c >> 8) & 255, (c >> 16) & 255);
+                    blended |= r > 56 && r < 245 && g > r && b > g;
+                }
+            }
+            ReleaseDC(null_mut(), screen);
+            assert!(blended, "antialiased curve edge");
+            assert!(gesture(WM_RBUTTONUP, POINT { x: 382, y: 245 }));
             // The held stroke expires independently of mouse-up, and cannot revive.
             let end = POINT { x: 380, y: 240 };
             assert!(gesture(WM_RBUTTONDOWN, start));

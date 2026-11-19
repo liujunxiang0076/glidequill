@@ -26,7 +26,23 @@ const RESULT: i32 = 122;
 const OPEN: i32 = 123;
 const EXIT: i32 = 124;
 const THEME: i32 = 127;
-const PAGE: i32 = 130;
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum Page {
+    General = 130,
+    Rules = 134,
+    Feedback = 135,
+}
+impl Page {
+    const ALL: [Self; 3] = [Self::General, Self::Rules, Self::Feedback];
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "常规设置",
+            Self::Rules => "手势规则",
+            Self::Feedback => "轨迹与字幕",
+        }
+    }
+}
 const AUTOSTART: i32 = 131;
 const IDLE: i32 = 132;
 const LINGER: i32 = 133;
@@ -36,7 +52,7 @@ const CLASS: &str = "GlideQuill.Rules.0.1";
 thread_local! {
     static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
     static CONFIG_READABLE:Cell<bool>=const{Cell::new(true)};
-    static SETTINGS_PAGE:Cell<bool>=const{Cell::new(false)};
+    static PAGE:Cell<Page>=const{Cell::new(Page::Rules)};
     static STARTUP_ON:Cell<bool>=const{Cell::new(false)};
     static DARK:Cell<bool>=const{Cell::new(false)};
     static WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
@@ -256,7 +272,8 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_ACTIVATE
-                if (wp & 0xffff) != WA_INACTIVE as usize && SETTINGS_PAGE.with(Cell::get) =>
+                if (wp & 0xffff) != WA_INACTIVE as usize
+                    && PAGE.with(Cell::get) == Page::General =>
             {
                 if let Err(e) = refresh_startup() {
                     label(RESULT, &format!("无法读取自启设置：{e}"));
@@ -299,25 +316,17 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
-                match id {
-                    PAGE => {
-                        let show = SETTINGS_PAGE.with(|v| {
-                            v.set(!v.get());
-                            v.get()
-                        });
-                        label(
-                            PAGE,
-                            if show {
-                                "返回手势规则"
-                            } else {
-                                "基础设置"
-                            },
-                        );
-                        if show && let Err(e) = refresh_startup() {
-                            label(RESULT, &format!("无法读取自启设置：{e}"));
-                        }
-                        ui::layout();
+                if let Some(page) = Page::ALL.into_iter().find(|&p| p as i32 == id) {
+                    PAGE.with(|v| v.set(page));
+                    if page == Page::General
+                        && let Err(e) = refresh_startup()
+                    {
+                        label(RESULT, &format!("无法读取自启设置：{e}"));
                     }
+                    ui::layout();
+                    return 0;
+                }
+                match id {
                     AUTOSTART => {
                         match refresh_startup()
                             .and_then(|on| startup::set(!on))
@@ -511,7 +520,7 @@ fn main() {
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("GlideQuill · 手势规则").as_ptr(),
+            wide("GlideQuill · 设置").as_ptr(),
             WINDOW_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

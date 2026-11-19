@@ -22,7 +22,8 @@ struct Trail {
     visible: bool,
     dirty: bool,
     idle_deadline: Option<Instant>,
-    result: Option<(&'static str, Instant)>,
+    action: Option<Direction>,
+    expires: Option<Instant>,
 }
 static TRAIL: Mutex<Trail> = Mutex::new(Trail {
     target: 0,
@@ -31,9 +32,23 @@ static TRAIL: Mutex<Trail> = Mutex::new(Trail {
     visible: false,
     dirty: false,
     idle_deadline: None,
-    result: None,
+    action: None,
+    expires: None,
 });
-thread_local! {static POPUP:Cell<HWND>=const{Cell::new(null_mut())};}
+#[derive(Clone, Copy, PartialEq)]
+struct Subtitle {
+    action: Direction,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    dpi: u32,
+}
+thread_local! {
+    static POPUP:Cell<HWND>=const{Cell::new(null_mut())};
+    static CAPTION:Cell<HWND>=const{Cell::new(null_mut())};
+    static SHOWN:Cell<Option<Subtitle>>=const{Cell::new(None)};
+}
 fn notify(window: HWND) {
     unsafe {
         PostMessageW(window, REFRESH, 0, 0);
@@ -48,7 +63,8 @@ pub fn begin(window: HWND, target: HWND, origin: POINT, dpi: u32) {
     state.dpi = dpi;
     state.visible = false;
     state.dirty = true;
-    state.result = None;
+    state.action = None;
+    state.expires = None;
     state.idle_deadline = None;
     drop(state);
     if previous {
@@ -68,7 +84,7 @@ fn append(points: &mut Vec<POINT>, pt: POINT) {
     }
     points.push(pt);
 }
-pub fn extend(window: HWND, pt: POINT) {
+pub fn extend(window: HWND, pt: POINT, direction: Option<Direction>) {
     let mut state = TRAIL.lock().unwrap();
     if state.target == 0 {
         return;
@@ -84,6 +100,7 @@ pub fn extend(window: HWND, pt: POINT) {
     }
     let timeout = settings::preferences().idle_ms;
     state.idle_deadline = (timeout > 0).then(|| now + Duration::from_millis(timeout.into()));
+    state.action = direction;
     let first = !state.visible;
     append(&mut state.points, pt);
     state.visible = true;
@@ -110,10 +127,8 @@ pub fn finish(window: HWND, pt: POINT, direction: Option<Direction>) {
     append(&mut state.points, pt);
     state.visible = true;
     state.dirty = true;
-    state.result = Some((
-        direction.map_or("未识别", |d| d.labels().1),
-        now + Duration::from_millis(result_ms.into()),
-    ));
+    state.action = direction;
+    state.expires = Some(now + Duration::from_millis(result_ms.into()));
     drop(state);
     notify(window);
 }
@@ -140,23 +155,37 @@ pub unsafe fn create() -> io::Result<()> {
         if RegisterClassW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
             return Err(io::Error::last_os_error());
         }
-        let w = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            class.as_ptr(),
-            null_mut(),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            null_mut(),
-            null_mut(),
-            inst,
-            null_mut(),
-        );
+        let new_popup = || {
+            CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST,
+                class.as_ptr(),
+                null_mut(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                inst,
+                null_mut(),
+            )
+        };
+        let w = new_popup();
         if w.is_null() {
             return Err(io::Error::last_os_error());
         }
+        let caption = new_popup();
+        if caption.is_null() {
+            let error = io::Error::last_os_error();
+            DestroyWindow(w);
+            return Err(error);
+        }
+        CAPTION.with(|c| c.set(caption));
         POPUP.with(|v| v.set(w));
         Result::Ok(())
     }
@@ -165,7 +194,19 @@ pub unsafe fn create() -> io::Result<()> {
 pub(super) fn test_popup() -> HWND {
     POPUP.with(Cell::get)
 }
+#[cfg(test)]
+pub(super) fn test_subtitle() -> HWND {
+    CAPTION.with(Cell::get)
+}
+fn hide_subtitle() {
+    if SHOWN.with(|v| v.take()).is_some() {
+        unsafe {
+            ShowWindow(CAPTION.with(Cell::get), SW_HIDE);
+        }
+    }
+}
 pub fn reset() {
+    hide_subtitle();
     *TRAIL.lock().unwrap() = Trail::default();
     unsafe {
         KillTimer(app_window(), TIMER);
@@ -175,6 +216,7 @@ pub fn reset() {
 pub unsafe fn destroy() {
     reset();
     unsafe {
+        DestroyWindow(CAPTION.with(|v| v.replace(null_mut())));
         DestroyWindow(POPUP.with(|v| v.replace(null_mut())));
     }
 }
@@ -186,24 +228,42 @@ pub unsafe fn refresh(window: HWND) {
         if !state.visible
             || state.target != GetForegroundWindow() as usize
             || state.idle_deadline.is_some_and(|t| Instant::now() >= t)
-            || state.result.is_some_and(|(_, t)| Instant::now() >= t)
+            || state.expires.is_some_and(|t| Instant::now() >= t)
         {
             if state.visible {
                 *state = Trail::default();
             }
             drop(state);
             KillTimer(window, TIMER);
+            hide_subtitle();
             ShowWindow(popup, SW_HIDE);
             return;
         }
         if !state.dirty {
             return;
         }
-        let (points, dpi, result) = (state.points.clone(), state.dpi, state.result.map(|r| r.0));
+        let (points, dpi, action, released) = (
+            state.points.clone(),
+            state.dpi,
+            state.action,
+            state.expires.is_some(),
+        );
         state.dirty = false;
         drop(state);
-        if draw(popup, &points, dpi, result) {
-            ShowWindow(popup, SW_SHOWNOACTIVATE);
+        if draw(
+            popup,
+            &points,
+            dpi,
+            (released && action.is_none()).then_some("未识别"),
+        ) {
+            if IsWindowVisible(popup) == 0 {
+                ShowWindow(popup, SW_SHOWNOACTIVATE);
+            }
+            if let (Some(action), Some(&end)) = (action, points.last()) {
+                show_subtitle(action, end, dpi);
+            } else {
+                hide_subtitle();
+            }
             if SetTimer(window, TIMER, 16, None) != 0 {
                 return;
             }
@@ -258,7 +318,8 @@ impl Surface {
                 return None;
             }
             GdipGraphicsClear(s.graphics, 0);
-            GdipSetSmoothingMode(s.graphics, SmoothingModeAntiAlias);
+            GdipSetSmoothingMode(s.graphics, SmoothingModeAntiAlias8x8);
+            GdipSetPixelOffsetMode(s.graphics, PixelOffsetModeHalf);
             Some(s)
         }
     }
@@ -284,7 +345,7 @@ impl Drop for Surface {
         }
     }
 }
-unsafe fn badge(graphics: *mut GpGraphics, label: &str, r: RECT, scale: f32) {
+unsafe fn badge(graphics: *mut GpGraphics, label: &str, r: RECT, font_px: f32) {
     unsafe {
         let mut brush = null_mut();
         let mut family = null_mut();
@@ -303,7 +364,7 @@ unsafe fn badge(graphics: *mut GpGraphics, label: &str, r: RECT, scale: f32) {
             null_mut(),
             &mut family,
         ) == Ok
-            && GdipCreateFont(family, 14.0 * scale, FontStyleRegular, UnitPixel, &mut font) == Ok
+            && GdipCreateFont(family, font_px, FontStyleRegular, UnitPixel, &mut font) == Ok
             && GdipCreateStringFormat(StringFormatFlagsNoWrap, 0, &mut format) == Ok
         {
             GdipSetSolidFillColor(brush, 0xffffffff);
@@ -390,36 +451,39 @@ unsafe fn draw(popup: HWND, points: &[POINT], dpi: u32, result: Option<&str>) ->
         let Some(s) = Surface::new(size.cx, size.cy) else {
             return false;
         };
-        let local: Vec<_> = points
-            .iter()
-            .map(|p| Point {
-                X: p.x - area.left,
-                Y: p.y - area.top,
-            })
-            .collect();
+        let path = smooth_path(points, area.left, area.top, scale);
         for (width, color) in [(5., 0xeaffffff), (3., 0xff3868d3)] {
             let mut pen = null_mut();
             if GdipCreatePen1(color, width * scale, UnitPixel, &mut pen) == Ok {
                 GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
                 GdipSetPenLineJoin(pen, LineJoinRound);
-                GdipDrawLinesI(s.graphics, pen, local.as_ptr(), local.len() as i32);
+                GdipDrawBeziers(s.graphics, pen, path.as_ptr(), path.len() as i32);
                 GdipDeletePen(pen);
             }
         }
         if let Some(caption) = result {
             OffsetRect(&mut label, -area.left, -area.top);
-            badge(s.graphics, caption, label, scale);
+            badge(s.graphics, caption, label, 14. * scale);
         }
+        present(
+            &s,
+            popup,
+            POINT {
+                x: area.left,
+                y: area.top,
+            },
+            size,
+        )
+    }
+}
+unsafe fn present(s: &Surface, popup: HWND, origin: POINT, size: SIZE) -> bool {
+    unsafe {
         GdipFlush(s.graphics, FlushIntentionSync);
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        let origin = POINT {
-            x: area.left,
-            y: area.top,
         };
         UpdateLayeredWindow(
             popup,
@@ -432,5 +496,120 @@ unsafe fn draw(popup: HWND, points: &[POINT], dpi: u32, result: Option<&str>) ->
             &blend,
             ULW_ALPHA,
         ) != 0
+    }
+}
+// Filter the display samples, then round each corner with a quadratic bounded by
+// its adjacent segments. GDI+ consumes the equivalent cubic control points.
+fn smooth_path(points: &[POINT], left: i32, top: i32, scale: f32) -> Vec<PointF> {
+    let local = |p: &POINT| PointF {
+        X: (p.x - left) as f32,
+        Y: (p.y - top) as f32,
+    };
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut knots = vec![local(&points[0])];
+    for p in &points[1..points.len() - 1] {
+        let p = local(p);
+        let prev = knots.last().unwrap();
+        if (p.X - prev.X).hypot(p.Y - prev.Y) >= 3. * scale {
+            knots.push(p);
+        }
+    }
+    let end = local(points.last().unwrap());
+    knots.push(end);
+    let mix = |a: PointF, b: PointF, t: f32| PointF {
+        X: a.X + (b.X - a.X) * t,
+        Y: a.Y + (b.Y - a.Y) * t,
+    };
+    let mut path = vec![knots[0]];
+    for triplet in knots.windows(3) {
+        let [a, corner, b] = [triplet[0], triplet[1], triplet[2]];
+        let approach = |point: PointF| {
+            let distance = (point.X - corner.X).hypot(point.Y - corner.Y);
+            mix(corner, point, (6. * scale / distance.max(0.01)).min(0.5))
+        };
+        let enter = approach(a);
+        let leave = approach(b);
+        let start = *path.last().unwrap();
+        path.extend([start, enter, enter]);
+        path.extend([
+            mix(enter, corner, 2. / 3.),
+            mix(leave, corner, 2. / 3.),
+            leave,
+        ]);
+    }
+    path.extend([*path.last().unwrap(), end, end]);
+    path
+}
+
+unsafe fn show_subtitle(action: Direction, end: POINT, fallback_dpi: u32) {
+    unsafe {
+        use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+        let monitor = MonitorFromPoint(end, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            hide_subtitle();
+            return;
+        }
+        let mut dpi = 0;
+        let mut dy = 0;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dy) < 0 || dpi == 0 {
+            dpi = fallback_dpi;
+        }
+        let scale = dpi as f32 / 96.;
+        let px = |v: f32| (v * scale).round() as i32;
+        let work = info.rcWork;
+        let label = action.labels().1;
+        let width = px(48. + label.chars().count() as f32 * 23.).min(work.right - work.left);
+        let height = px(48.).min(work.bottom - work.top);
+        let subtitle = Subtitle {
+            action,
+            x: work.left + (work.right - work.left - width) / 2,
+            y: (work.bottom - px(36.) - height).max(work.top),
+            width,
+            height,
+            dpi,
+        };
+        if SHOWN.with(Cell::get) == Some(subtitle) {
+            return;
+        }
+        let Some(s) = Surface::new(width, height) else {
+            hide_subtitle();
+            return;
+        };
+        badge(
+            s.graphics,
+            label,
+            RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            },
+            22. * scale,
+        );
+        let popup = CAPTION.with(Cell::get);
+        if present(
+            &s,
+            popup,
+            POINT {
+                x: subtitle.x,
+                y: subtitle.y,
+            },
+            SIZE {
+                cx: width,
+                cy: height,
+            },
+        ) {
+            ShowWindow(popup, SW_SHOWNOACTIVATE);
+            SetWindowTextW(popup, wide(label).as_ptr());
+            SHOWN.with(|v| v.set(Some(subtitle)));
+        } else {
+            hide_subtitle();
+        }
     }
 }

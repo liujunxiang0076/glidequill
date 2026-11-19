@@ -3,11 +3,15 @@ use windows_sys::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
 
 // Layout is in device-independent pixels. Convert once at each drawing/Win32 boundary.
-pub const WIDTH: i32 = 592;
-pub const HEIGHT: i32 = 414;
-const LEFT: i32 = 24;
-const RIGHT: i32 = WIDTH - LEFT;
-const ROW_START: i32 = 168;
+pub const WIDTH: i32 = 720;
+pub const HEIGHT: i32 = 380;
+const RAIL: i32 = 160;
+const LEFT: i32 = RAIL + 24;
+const RIGHT: i32 = WIDTH - 24;
+const CARD_TOP: i32 = 94;
+const SETTING_HEIGHT: i32 = 68;
+const FIELD: i32 = LEFT + 260;
+const ROW_START: i32 = CARD_TOP + 34;
 const ROW_HEIGHT: i32 = 46;
 pub const RULE_ROW: i32 = 140;
 thread_local! { static DPI: Cell<u32> = const { Cell::new(96) }; }
@@ -241,14 +245,16 @@ unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u
 }
 fn control_bounds(id: i32) -> [i32; 4] {
     match id {
-        THEME => [RIGHT - 89, 12, 89, 30],
-        PAGE => [RIGHT - 197, 12, 100, 30],
-        TOGGLE if SETTINGS_PAGE.with(Cell::get) => [RIGHT - 125, 135, 113, 34],
-        TOGGLE => [RIGHT - 113, 67, 113, 34],
-        AUTOSTART => [RIGHT - 125, 193, 113, 34],
-        IDLE => [RIGHT - 150, 251, 132, 34],
-        LINGER => [RIGHT - 150, 309, 132, 34],
-        RESULT => [LEFT, 366, RIGHT - LEFT, 30],
+        id if id == Page::General as i32 => [10, 75, RAIL - 20, 38],
+        id if id == Page::Rules as i32 => [10, 118, RAIL - 20, 38],
+        id if id == Page::Feedback as i32 => [10, 161, RAIL - 20, 38],
+        TOGGLE if PAGE.with(Cell::get) == Page::General => [RIGHT - 125, CARD_TOP + 17, 113, 34],
+        TOGGLE => [RIGHT - 113, 20, 113, 34],
+        AUTOSTART => [RIGHT - 125, CARD_TOP + SETTING_HEIGHT + 17, 113, 34],
+        THEME => [RIGHT - 145, CARD_TOP + 2 * SETTING_HEIGHT + 17, 132, 34],
+        IDLE => [RIGHT - 145, CARD_TOP + 17, 132, 34],
+        LINGER => [RIGHT - 145, CARD_TOP + SETTING_HEIGHT + 17, 132, 34],
+        RESULT => [LEFT, HEIGHT - 35, RIGHT - LEFT, 26],
         _ => [
             LEFT + 1,
             ROW_START + (id - RULE_ROW) * ROW_HEIGHT,
@@ -258,17 +264,20 @@ fn control_bounds(id: i32) -> [i32; 4] {
     }
 }
 fn controls() -> impl Iterator<Item = i32> {
-    [THEME, PAGE, TOGGLE, AUTOSTART, IDLE, LINGER, RESULT]
+    [THEME, TOGGLE, AUTOSTART, IDLE, LINGER, RESULT]
         .into_iter()
+        .chain(Page::ALL.map(|p| p as i32))
         .chain(RULE_ROW..RULE_ROW + 4)
 }
 pub unsafe fn layout() {
     unsafe {
         for id in controls() {
-            let settings = SETTINGS_PAGE.with(Cell::get);
+            let page = PAGE.with(Cell::get);
             let visible = match id {
-                AUTOSTART | IDLE | LINGER => settings,
-                RULE_ROW..=143 => !settings,
+                THEME | AUTOSTART => page == Page::General,
+                IDLE | LINGER => page == Page::Feedback,
+                TOGGLE => page != Page::Feedback,
+                RULE_ROW..=143 => page == Page::Rules,
                 _ => true,
             };
             let [x, y, w, h] = control_bounds(id).map(px);
@@ -300,7 +309,9 @@ pub unsafe fn build() {
     unsafe {
         for (id, name) in [
             (THEME, "深色"),
-            (PAGE, "基础设置"),
+            (Page::General as i32, Page::General.title()),
+            (Page::Rules as i32, Page::Rules.title()),
+            (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
             (AUTOSTART, "启用登录自启"),
             (IDLE, "停笔取消时间"),
@@ -346,12 +357,12 @@ pub unsafe fn paint(w: HWND) {
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(w, &mut ps);
         fill(dc, bounds(0, 0, WIDTH, HEIGHT), p.base);
-        fill(dc, bounds(0, 0, WIDTH, 54), p.rail);
-        fill(dc, bounds(0, 53, WIDTH, 54), p.edge);
+        fill(dc, bounds(0, 0, RAIL, HEIGHT), p.rail);
+        fill(dc, bounds(RAIL - 1, 0, RAIL, HEIGHT), p.edge);
         DrawIconEx(
             dc,
-            px(LEFT),
-            px(13),
+            px(17),
+            px(20),
             GetClassLongPtrW(w, GCLP_HICON) as HICON,
             px(28),
             px(28),
@@ -362,50 +373,96 @@ pub unsafe fn paint(w: HWND) {
         text(
             dc,
             "GlideQuill",
-            bounds(LEFT + 36, 9, 240, 44),
+            bounds(50, 14, RAIL - 3, 54),
             19,
             Face::Brand,
             p.text,
             0,
         );
-        if SETTINGS_PAGE.with(Cell::get) {
-            text(
+        let page = PAGE.with(Cell::get);
+        text(
+            dc,
+            page.title(),
+            bounds(LEFT, 14, RIGHT - 120, 55),
+            23,
+            Face::Strong,
+            p.text,
+            0,
+        );
+        let description = match page {
+            Page::Rules => "按住右键划动，匹配的动作将在屏幕下方显示。",
+            Page::General => "管理手势启停、登录启动与窗口外观。",
+            Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
+        };
+        text(
+            dc,
+            description,
+            bounds(LEFT, 54, RIGHT, 80),
+            13,
+            Face::Body,
+            p.muted,
+            0,
+        );
+        if page == Page::Rules {
+            panel(
                 dc,
-                "基础设置",
-                bounds(LEFT, 63, RIGHT, 103),
-                22,
-                Face::Strong,
-                p.text,
-                0,
+                bounds(LEFT, CARD_TOP, RIGHT, ROW_START + ROW_HEIGHT * 4 + 6),
+                p.surface,
+                p.edge,
+                8,
             );
             text(
                 dc,
-                "更改即时保存。",
-                bounds(LEFT, 99, RIGHT, 122),
-                13,
+                "划动方向",
+                bounds(LEFT + 17, CARD_TOP, FIELD, ROW_START),
+                12,
                 Face::Body,
                 p.muted,
                 0,
             );
-            panel(dc, bounds(LEFT, 123, RIGHT, 357), p.surface, p.edge, 8);
-            for (i, (name, desc)) in [
-                ("全局手势", "下次启动时恢复当前启停状态"),
-                ("登录 Windows 时自启", "登录后在系统托盘运行"),
-                ("停笔后取消手势", "按住右键停止移动后，清除本次轨迹"),
-                ("松键后保留时间", "控制轨迹和识别结果的显示时长"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let y = 123 + i as i32 * 58;
+            text(
+                dc,
+                "对应动作（仅预览）",
+                bounds(FIELD, CARD_TOP, RIGHT, ROW_START),
+                12,
+                Face::Body,
+                p.muted,
+                0,
+            );
+        } else {
+            let rows: &[(&str, &str)] = match page {
+                Page::General => &[
+                    ("全局手势", "下次启动时恢复当前状态"),
+                    ("登录时自启", "登录 Windows 后在系统托盘运行"),
+                    ("窗口外观", "切换浅色与深色主题"),
+                ],
+                _ => &[
+                    ("停笔后取消手势", "按住右键停止移动后，清除本次轨迹"),
+                    ("松键后保留时间", "轨迹和屏幕下方字幕同时消失"),
+                ],
+            };
+            panel(
+                dc,
+                bounds(
+                    LEFT,
+                    CARD_TOP,
+                    RIGHT,
+                    CARD_TOP + SETTING_HEIGHT * rows.len() as i32,
+                ),
+                p.surface,
+                p.edge,
+                8,
+            );
+            for (i, (name, desc)) in rows.iter().enumerate() {
+                let y = CARD_TOP + i as i32 * SETTING_HEIGHT;
                 if i > 0 {
-                    fill(dc, bounds(LEFT + 1, y, RIGHT - 1, y + 1), p.edge);
+                    fill(dc, bounds(LEFT + 16, y, RIGHT - 16, y + 1), p.edge);
                 }
                 text(
                     dc,
                     name,
-                    bounds(LEFT + 16, y + 6, RIGHT - 160, y + 33),
-                    14,
+                    bounds(LEFT + 16, y + 8, RIGHT - 154, y + 35),
+                    15,
                     Face::Strong,
                     p.text,
                     0,
@@ -413,59 +470,15 @@ pub unsafe fn paint(w: HWND) {
                 text(
                     dc,
                     desc,
-                    bounds(LEFT + 16, y + 29, RIGHT - 160, y + 53),
+                    bounds(LEFT + 16, y + 34, RIGHT - 154, y + 59),
                     12,
                     Face::Body,
                     p.muted,
                     0,
                 );
             }
-            EndPaint(w, &ps);
-            return;
         }
-        text(
-            dc,
-            "手势规则",
-            bounds(LEFT, 63, 300, 103),
-            22,
-            Face::Strong,
-            p.text,
-            0,
-        );
-        text(
-            dc,
-            "按住右键划动查看轨迹，松开查看识别结果。",
-            bounds(LEFT, 103, RIGHT, 129),
-            13,
-            Face::Body,
-            p.muted,
-            0,
-        );
-        panel(
-            dc,
-            bounds(LEFT, 138, RIGHT, ROW_START + ROW_HEIGHT * 4 + 7),
-            p.surface,
-            p.edge,
-            8,
-        );
-        text(
-            dc,
-            "划动方向",
-            bounds(LEFT + 17, 138, 285, ROW_START),
-            12,
-            Face::Body,
-            p.muted,
-            0,
-        );
-        text(
-            dc,
-            "对应动作（仅预览）",
-            bounds(304, 138, RIGHT - 12, ROW_START),
-            12,
-            Face::Body,
-            p.muted,
-            0,
-        );
+        fill(dc, bounds(LEFT, HEIGHT - 41, RIGHT, HEIGHT - 40), p.edge);
         EndPaint(w, &ps);
     }
 }
@@ -510,7 +523,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             text(
                 dc,
                 action,
-                bounds(304 - LEFT - 1, 0, RIGHT - LEFT - 10, ROW_HEIGHT),
+                bounds(FIELD - LEFT - 1, 0, RIGHT - LEFT - 10, ROW_HEIGHT),
                 14,
                 Face::Body,
                 p.text,
@@ -520,7 +533,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             fill(dc, r, p.base);
             text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);
         } else if id == TOGGLE || id == AUTOSTART {
-            let settings = SETTINGS_PAGE.with(Cell::get);
+            let settings = PAGE.with(Cell::get) == Page::General;
             fill(dc, r, if settings { p.surface } else { p.base });
             let on = if id == AUTOSTART {
                 STARTUP_ON.with(Cell::get)
@@ -589,23 +602,39 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 p.muted,
                 DT_CENTER,
             );
-        } else if id == PAGE {
+        } else if let Some(page) = Page::ALL.into_iter().find(|&page| page as i32 == id) {
+            let selected = PAGE.with(Cell::get) == page;
             fill(dc, r, p.rail);
-            rounded(dc, r, p.selected, 6);
+            if selected || item.itemState & ODS_SELECTED != 0 {
+                rounded(dc, r, p.selected, 7);
+            }
+            let color = if selected { p.accent } else { p.text };
+            let icon = match page {
+                Page::General => "\u{e713}",
+                Page::Rules => "\u{e8fd}",
+                Page::Feedback => "\u{e7f4}",
+            };
             text(
                 dc,
-                &caption(item.hwndItem),
-                r,
-                13,
-                Face::Strong,
-                p.accent,
+                icon,
+                bounds(10, 0, 33, 38),
+                16,
+                Face::Icon,
+                color,
                 DT_CENTER,
             );
+            text(
+                dc,
+                page.title(),
+                bounds(41, 0, 139, 38),
+                14,
+                if selected { Face::Strong } else { Face::Body },
+                color,
+                0,
+            );
         } else if id == THEME {
-            fill(dc, r, p.rail);
-            if item.itemState & ODS_SELECTED != 0 {
-                rounded(dc, r, p.selected, 6);
-            }
+            fill(dc, r, p.surface);
+            panel(dc, r, p.base, p.edge, 6);
             let icon = if DARK.with(Cell::get) {
                 "\u{e706}"
             } else {
@@ -614,7 +643,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             text(
                 dc,
                 icon,
-                bounds(4, 0, 24, 30),
+                bounds(7, 0, 29, 34),
                 14,
                 Face::Icon,
                 p.muted,
@@ -622,8 +651,8 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             );
             text(
                 dc,
-                &format!("{}外观", caption(item.hwndItem)),
-                bounds(27, 0, 89, 30),
+                &format!("切换至{}", caption(item.hwndItem)),
+                bounds(35, 0, 132, 34),
                 13,
                 Face::Body,
                 p.text,

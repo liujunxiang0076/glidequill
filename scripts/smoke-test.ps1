@@ -97,11 +97,15 @@ try {
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
     Save-Screenshot $w 'windows-light.png'
     [void](Send $w 0x111 130)
-    Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'No settings page'
+    Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,131))) 'Missing general settings'
+    Require (![GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'Timing control visible in General'
     Require ((Get-Label $w 131) -eq '启用登录自启') 'Autostart should default off'
     Save-Screenshot $w 'windows-settings.png'
     [void](Send $w 0x111 131)
     Require ((Get-ItemPropertyValue -LiteralPath $testKey -Name GlideQuill) -ceq ('"'+$exe+'" --startup')) 'Bad logon command'
+    [void](Send $w 0x111 135)
+    Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'Missing timing control'
+    Require (![GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,140))) 'Rule visible in Feedback'
     [void](Send $w 0x111 203)
     [void](Send $w 0x111 211)
     Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting not applied'
@@ -117,6 +121,7 @@ try {
     [void](Send $w 0x111 121)
     [void](Send $w 0x111 127)
     Require ((Get-Label $w 127) -eq '浅色') 'Theme failed'
+    [void](Send $w 0x111 134)
     Save-Screenshot $w 'windows-dark.png'
     [void](Send $w 0x10)
     Require (![GestureSmoke]::IsWindowVisible($w)) 'Tray hide failed'
@@ -133,7 +138,7 @@ try {
     $p=[Diagnostics.Process]::Start($start)
     $deadline=[Diagnostics.Stopwatch]::StartNew()
     do {
-        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","GlideQuill · 手势规则")
+        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","GlideQuill · 设置")
         if ($w -ne 0 -and (Get-Label $w 121) -eq '暂停全局手势') {break}
         Start-Sleep -Milliseconds 40
     } while (!$p.HasExited -and $deadline.ElapsedMilliseconds -lt 5000)
