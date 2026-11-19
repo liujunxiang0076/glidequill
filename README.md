@@ -2,6 +2,10 @@
 
 Windows x64 鼠标手势工具，Rust + Win32。0.1.0 是第一版可运行雏形。
 
+## 实际 Windows 界面
+
+左侧选择通用规则或浏览器范围，右侧直接编辑四个方向的动作并保存。底部练习区显示当前规则的匹配结果。[浅色窗口](docs/windows-light.png) · [深色窗口](docs/windows-dark.png)
+
 ## 本地试用
 
 在 Windows x64 上使用 Rust stable（本次验证为 1.96.1）和 MSVC C++ 构建工具。

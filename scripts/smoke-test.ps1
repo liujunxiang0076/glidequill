@@ -1,11 +1,16 @@
 # Run after cargo build --release. Only send messages to the test instance.
+param([string]$Executable, [string]$ScreenshotDirectory)
 $ErrorActionPreference = 'Stop'
-$exe = (Resolve-Path (Join-Path $PSScriptRoot '../target/release/glidequill.exe')).Path
+if (!$Executable) { $Executable = Join-Path $PSScriptRoot '../target/release/glidequill.exe' }
+$exe = (Resolve-Path $Executable).Path
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class GestureSmoke {
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out Bounds r);
+    public struct Bounds {public int Left,Top,Right,Bottom;}
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
@@ -20,11 +25,25 @@ function Get-Label($window, $id) {
     [void][GestureSmoke]::GetWindowText([GestureSmoke]::GetDlgItem($window,$id),$text,256)
     $text.ToString()
 }
+function Save-Screenshot($w,$name) {
+    if (!$ScreenshotDirectory) { return }
+    Add-Type -AssemblyName System.Drawing
+    $r = [GestureSmoke+Bounds]::new()
+    [void][GestureSmoke]::GetWindowRect($w,[ref]$r)
+    $bmp = [Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top)
+    $g = [Drawing.Graphics]::FromImage($bmp)
+    $dc = $g.GetHdc()
+    try { Require ([GestureSmoke]::PrintWindow($w,$dc,2)) 'Window capture failed' }
+    finally { $g.ReleaseHdc($dc); $g.Dispose() }
+    try { $bmp.Save((Join-Path $ScreenshotDirectory $name),[Drawing.Imaging.ImageFormat]::Png) }
+    finally { $bmp.Dispose() }
+}
 function Require($condition,$message) { if (!$condition) { throw $message } }
-Require (!(Get-Process glidequill -ErrorAction SilentlyContinue)) 'Exit an existing GlideQuill instance before testing.'
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ('glidequill-test-' + [guid]::NewGuid())
 $start = [Diagnostics.ProcessStartInfo]::new($exe)
 $start.UseShellExecute = $false
+$start.EnvironmentVariables['GLIDEQUILL_UI_TEST_ID'] = [guid]::NewGuid().ToString()
 $start.EnvironmentVariables['LOCALAPPDATA'] = $root
 function Start-TestApp {
     $p = [Diagnostics.Process]::Start($start)
@@ -37,6 +56,7 @@ $p = Start-TestApp
 try {
     $w=$p.MainWindowHandle
     Require ((Get-Label $w 121) -eq '启用全局手势') 'Unexpected startup hook state'
+    Save-Screenshot $w 'windows-light.png'
     $pad=[GestureSmoke]::GetDlgItem($w,125)
     [void](Send $pad 0x204 2 (30*65536+120))
     [void](Send $pad 0x200 2 (30*65536+55))
@@ -50,6 +70,7 @@ try {
     Require ($cfg.browser[2] -eq 'Home') 'Save failed'
     [void](Send $w 0x111 127)
     Require ((Get-Label $w 127) -eq '浅色') 'Theme failed'
+    Save-Screenshot $w 'windows-dark.png'
     [void](Send $w 0x10)
     Require (![GestureSmoke]::IsWindowVisible($w)) 'Tray hide failed'
     $second=[Diagnostics.Process]::Start($start)

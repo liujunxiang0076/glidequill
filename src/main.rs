@@ -2,6 +2,7 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 
 mod input;
+mod ui;
 use glidequill::{ACTIONS, Action, Config, DIRECTIONS, Stroke};
 use std::{
     cell::{Cell, RefCell},
@@ -31,6 +32,7 @@ const PAD: i32 = 125;
 const BROWSER: i32 = 126;
 const CLASS: &str = "GlideQuill.Rules.0.1";
 thread_local! {
+    static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
     static DARK:Cell<bool>=const{Cell::new(false)};
     static TRAIL:RefCell<Vec<POINT>>=const{RefCell::new(Vec::new())};
     static CONFIG:RefCell<Config>=RefCell::new(Config::default());
@@ -148,6 +150,9 @@ fn read_rules(c: &mut Config) {
     }
 }
 fn toggle() {
+    if TEST_INSTANCE.with(Cell::get) {
+        return;
+    }
     unsafe {
         let old = HOOK.with(Cell::get);
         if old.is_null() {
@@ -254,9 +259,7 @@ unsafe extern "system" fn pad_proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 GetClientRect(w, &mut r);
                 SetBkMode(dc, TRANSPARENT as i32);
                 let dark = DARK.with(Cell::get);
-                let brush = CreateSolidBrush(if dark { 0x003A3028 } else { 0x00F9F5EF });
-                FillRect(dc, &r, brush);
-                DeleteObject(brush);
+                ui::pad_background(dc, r, TRAIL.with(|t| t.borrow().len() < 2));
                 TRAIL.with(|trail| {
                     let trail = trail.borrow();
                     if trail.len() > 1 {
@@ -266,16 +269,6 @@ unsafe extern "system" fn pad_proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         Polyline(dc, trail.as_ptr(), trail.len() as i32);
                         SelectObject(dc, old);
                         DeleteObject(pen);
-                    } else {
-                        SetTextColor(dc, if dark { 0x00E5DAD3 } else { 0x00584D42 });
-                        let mut t = wide("按住右键，在这里试画");
-                        DrawTextW(
-                            dc,
-                            t.as_mut_ptr(),
-                            -1,
-                            &mut r,
-                            DT_SINGLELINE | DT_CENTER | DT_VCENTER,
-                        );
                     }
                 });
                 EndPaint(w, &ps);
@@ -290,70 +283,26 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
         match m {
             WM_CREATE => {
                 WINDOW.with(|v| v.set(w));
-                control("BUTTON", "深色", THEME, WS_TABSTOP, [252, 18, 74, 32]);
-                control("BUTTON", "通用规则", SCOPE, WS_TABSTOP, [20, 18, 108, 32]);
-                control(
-                    "BUTTON",
-                    "浏览器覆盖",
-                    BROWSER,
-                    WS_TABSTOP,
-                    [136, 18, 108, 32],
-                );
-                control(
-                    "BUTTON",
-                    "启用全局手势",
-                    TOGGLE,
-                    WS_TABSTOP,
-                    [334, 18, 136, 32],
-                );
-                for (i, name) in ["←   向左划", "→   向右划", "↑   向上划", "↓   向下划"]
-                    .iter()
-                    .enumerate()
-                {
-                    let y = 74 + i as i32 * 44;
-                    control("STATIC", name, 0, 0, [24, y, 110, 30]);
-                    control(
-                        "COMBOBOX",
-                        "",
-                        FIRST + i as i32,
-                        WS_TABSTOP | CBS_DROPDOWNLIST as u32,
-                        [142, y - 3, 183, 260],
-                    );
-                }
-                control("BUTTON", "保存规则", SAVE, WS_TABSTOP, [335, 201, 134, 32]);
-                control(
-                    "GlideQuill.Practice",
-                    "",
-                    PAD,
-                    WS_BORDER,
-                    [20, 260, 450, 82],
-                );
-                control(
-                    "STATIC",
-                    "已暂停 · 请先暂停其他手势工具，再启用全局手势",
-                    RESULT,
-                    0,
-                    [22, 364, 470, 42],
-                );
+                ui::build();
                 populate();
                 TASKBAR.with(|id| id.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
                 TRAY_OK.with(|ok| ok.set(notify(NIM_ADD)));
                 0
             }
-            WM_ERASEBKGND | WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX if DARK.with(Cell::get) => {
-                let dc = wp as HDC;
-                SetTextColor(dc, 0x00F3EDE9);
-                SetBkColor(dc, 0x00261D19);
-                let brush = GetStockObject(DC_BRUSH);
-                SetDCBrushColor(dc, 0x00261D19);
-                if m == WM_ERASEBKGND {
-                    let mut r = RECT::default();
-                    GetClientRect(w, &mut r);
-                    FillRect(dc, &r, brush);
-                    1
-                } else {
-                    brush as isize
-                }
+            WM_PAINT => {
+                ui::paint(w);
+                0
+            }
+            WM_ERASEBKGND => 1,
+            WM_CTLCOLORSTATIC => ui::static_style(wp as HDC),
+            WM_MEASUREITEM => {
+                let item = &mut *(lp as *mut windows_sys::Win32::UI::Controls::MEASUREITEMSTRUCT);
+                item.itemHeight = 24;
+                1
+            }
+            WM_DRAWITEM => {
+                ui::item(&*(lp as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT));
+                1
             }
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
@@ -373,6 +322,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             return 0;
                         }
                         GROUP.with(|v| v.set(id == BROWSER));
+                        RedrawWindow(w, null_mut(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
                         populate();
                         label(
                             RESULT,
@@ -482,13 +432,18 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
 }
 fn main() {
     unsafe {
-        let class = wide(CLASS);
+        let test_id = std::env::var("GLIDEQUILL_UI_TEST_ID")
+            .ok()
+            .filter(|id| id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        TEST_INSTANCE.with(|v| v.set(test_id.is_some()));
+        let suffix = test_id.map(|id| format!(".test.{id}")).unwrap_or_default();
+        let class = wide(&format!("{CLASS}{suffix}"));
         // Keep the handle live for the message loop, including startup and shutdown.
         use std::os::windows::io::{FromRawHandle, OwnedHandle};
         let mutex = windows_sys::Win32::System::Threading::CreateMutexW(
             null_mut(),
             0,
-            wide(r"Local\GlideQuill.Rules.Instance").as_ptr(),
+            wide(&format!(r"Local\GlideQuill.Rules.Instance{suffix}")).as_ptr(),
         );
         if mutex.is_null() {
             return;
@@ -533,6 +488,18 @@ fn main() {
                 return;
             }
         }
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: ui::WIDTH,
+            bottom: ui::HEIGHT,
+        };
+        AdjustWindowRectEx(
+            &mut frame,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            0,
+            0,
+        );
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
@@ -540,8 +507,8 @@ fn main() {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            520,
-            460,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
             null_mut(),
             null_mut(),
             inst,
