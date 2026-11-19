@@ -25,8 +25,11 @@ pub enum Action {
     Paste,
     Home,
     End,
+    Minimize,
+    Maximize,
+    Close,
 }
-pub const ACTIONS: [(Action, &str); 8] = [
+pub const ACTIONS: [(Action, &str); 11] = [
     (Action::Inherit, "沿用通用"),
     (Action::Off, "停用"),
     (Action::Back, "后退"),
@@ -35,6 +38,9 @@ pub const ACTIONS: [(Action, &str); 8] = [
     (Action::Paste, "粘贴"),
     (Action::Home, "页面顶部"),
     (Action::End, "页面底部"),
+    (Action::Minimize, "最小化窗口"),
+    (Action::Maximize, "最大化／还原"),
+    (Action::Close, "关闭当前窗口"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
