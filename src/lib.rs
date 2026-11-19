@@ -19,9 +19,13 @@ pub enum Gesture {
     UpThenRight,
     DownThenLeft,
     DownThenRight,
+    LeftThenUp,
+    LeftThenDown,
+    RightThenUp,
+    RightThenDown,
 }
 pub const BASIC_COUNT: usize = 8;
-pub const GESTURES: [Gesture; 16] = [
+pub const GESTURES: [Gesture; 20] = [
     Gesture::Left,
     Gesture::Right,
     Gesture::Up,
@@ -38,6 +42,10 @@ pub const GESTURES: [Gesture; 16] = [
     Gesture::UpThenRight,
     Gesture::DownThenLeft,
     Gesture::DownThenRight,
+    Gesture::LeftThenUp,
+    Gesture::LeftThenDown,
+    Gesture::RightThenUp,
+    Gesture::RightThenDown,
 ];
 
 impl Gesture {
@@ -65,6 +73,10 @@ impl Gesture {
             Self::UpThenRight => "上再右",
             Self::DownThenLeft => "下再左",
             Self::DownThenRight => "下再右",
+            Self::LeftThenUp => "左再上",
+            Self::LeftThenDown => "左再下",
+            Self::RightThenUp => "右再上",
+            Self::RightThenDown => "右再下",
         }
     }
     pub const fn arrow(self) -> &'static str {
@@ -85,6 +97,10 @@ impl Gesture {
             Self::UpThenRight => "↑→",
             Self::DownThenLeft => "↓←",
             Self::DownThenRight => "↓→",
+            Self::LeftThenUp => "←↑",
+            Self::LeftThenDown => "←↓",
+            Self::RightThenUp => "→↑",
+            Self::RightThenDown => "→↓",
         }
     }
 }
@@ -145,7 +161,7 @@ const UP: Axis = (0., -1.);
 const DOWN: Axis = (0., 1.);
 const LEFT: Axis = (-1., 0.);
 const RIGHT: Axis = (1., 0.);
-const TWO_LEG: [(Gesture, Axis, Axis); 8] = [
+const TWO_LEG: [(Gesture, Axis, Axis); 12] = [
     (Gesture::UpDown, UP, DOWN),
     (Gesture::DownUp, DOWN, UP),
     (Gesture::LeftRight, LEFT, RIGHT),
@@ -154,6 +170,10 @@ const TWO_LEG: [(Gesture, Axis, Axis); 8] = [
     (Gesture::UpThenRight, UP, RIGHT),
     (Gesture::DownThenLeft, DOWN, LEFT),
     (Gesture::DownThenRight, DOWN, RIGHT),
+    (Gesture::LeftThenUp, LEFT, UP),
+    (Gesture::LeftThenDown, LEFT, DOWN),
+    (Gesture::RightThenUp, RIGHT, UP),
+    (Gesture::RightThenDown, RIGHT, DOWN),
 ];
 #[derive(Default, Clone, Copy)]
 struct Travel {
@@ -334,7 +354,7 @@ mod tests {
         for points in [
             vec![(3, 2)],
             vec![(16, 16)],
-            vec![(60, 0), (60, 60)],
+            vec![(60, 0), (60, 60), (120, 60)],
             vec![(80, 0), (0, 0), (30, 0)],
         ] {
             let mut s = Stroke::new(0, 0);

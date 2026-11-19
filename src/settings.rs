@@ -26,24 +26,17 @@ pub struct Preferences {
     pub idle_ms: u32,
     pub result_ms: u32,
 }
-// Preserve bindings saved before the two-leg gestures were introduced.
+// New gestures are appended so the two previous on-disk layouts keep their indices.
 fn read_bindings<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<[glidequill::Action; glidequill::GESTURES.len()], D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Saved {
-        Current([glidequill::Action; glidequill::GESTURES.len()]),
-        Basic([glidequill::Action; glidequill::BASIC_COUNT]),
+    let saved = Vec::<glidequill::Action>::deserialize(d)?;
+    if ![glidequill::BASIC_COUNT, 16, glidequill::GESTURES.len()].contains(&saved.len()) {
+        return Err(serde::de::Error::custom("绑定数量与支持的配置版本不符"));
     }
-    Ok(match Saved::deserialize(d)? {
-        Saved::Current(all) => all,
-        Saved::Basic(basic) => {
-            let mut all = glidequill::DEFAULT_BINDINGS;
-            all[..basic.len()].copy_from_slice(&basic);
-            all
-        }
-    })
+    let mut bindings = glidequill::DEFAULT_BINDINGS;
+    bindings[..saved.len()].copy_from_slice(&saved);
+    Ok(bindings)
 }
 const DEFAULTS: Preferences = Preferences {
     bindings: glidequill::DEFAULT_BINDINGS,

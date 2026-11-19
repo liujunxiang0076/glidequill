@@ -245,6 +245,17 @@ try {
     [void](Send $w 0x111 (0x10000+165) $diagonal)
     [void](Send $turn 0x14e 6)
     [void](Send $w 0x111 (0x10000+173) $turn)
+    $horizontal=[GestureSmoke]::GetDlgItem($w,179)
+    Require ([GestureSmoke]::IsWindowVisible($horizontal) -and (Get-Label $w 159) -eq '右再下') 'Missing horizontal corner'
+    Require ((Send $horizontal 0x147).ToInt32() -eq 0) 'New corner has a default action'
+    [void](Send $horizontal 0x14e 1)
+    [void](Send $w 0x111 (0x10000+179) $horizontal)
+    [void](Send $w 0x111 191)
+    $returning=[GestureSmoke]::GetDlgItem($w,168)
+    Require ([GestureSmoke]::IsWindowVisible($returning) -and ![GestureSmoke]::IsWindowVisible($horizontal)) 'Return group must only show reversals'
+    Require (![GestureSmoke]::IsWindowEnabled($reset)) 'Corner edits enabled reset in return group'
+    [void](Send $w 0x111 139)
+    Require ((Get-Label $w 188) -eq '有 3 项未保存') 'Editing a new corner lost previous drafts'
     Save-Screenshot $w 'windows-special.png'
     [void](Send ([GestureSmoke]::GetDlgItem($w,138)) 0xf5)
     # Simulate a write failure, then retry without re-entering the draft.
@@ -391,6 +402,7 @@ try {
     [void](Send $w 0x111 130)
     Require ((Send ([GestureSmoke]::GetDlgItem($w,165)) 0x147).ToInt32() -eq 5) 'Diagonal binding not restored'
     Require ((Send ([GestureSmoke]::GetDlgItem($w,173)) 0x147).ToInt32() -eq 6) 'Saved special binding not restored'
+    Require ((Send ([GestureSmoke]::GetDlgItem($w,179)) 0x147).ToInt32() -eq 1) 'New horizontal corner binding not restored'
     Require ((Get-Label $w 127) -eq '深色 · 已选中') 'Theme was not restored'
     Require ((Get-Label $w 181) -like '*已关闭') 'Fullscreen switch was not restored'
     Require ((Get-Label $w 182) -like '*0 个应用') 'Deleted legacy exclusion returned after restart'

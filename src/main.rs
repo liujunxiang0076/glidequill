@@ -39,12 +39,15 @@ const DIRTY_RULES: i32 = 188;
 const RESET_RULES: i32 = 136;
 const SAVE_RULES: i32 = 137;
 const BASIC_TAB: i32 = 138;
-const SPECIAL_TAB: i32 = 139;
+const CORNER_TAB: i32 = 139;
+const RETURN_TAB: i32 = 191;
+const RULE_TABS: [i32; 3] = [BASIC_TAB, RETURN_TAB, CORNER_TAB];
+const FIRST_CORNER: usize = glidequill::Gesture::UpThenLeft as usize;
 fn rule_range() -> std::ops::Range<usize> {
-    if SPECIAL_GROUP.with(Cell::get) {
-        BASIC_COUNT..GESTURES.len()
-    } else {
-        0..BASIC_COUNT
+    match ACTIVE_TAB.get() {
+        RETURN_TAB => BASIC_COUNT..FIRST_CORNER,
+        CORNER_TAB => FIRST_CORNER..GESTURES.len(),
+        _ => 0..BASIC_COUNT,
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,7 +80,7 @@ const CLASS: &str = "GlideQuill.Rules.0.1";
 thread_local! {
     static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
     static CONFIG_READABLE:Cell<bool>=const{Cell::new(true)};
-    static SPECIAL_GROUP: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_TAB: Cell<i32> = const { Cell::new(BASIC_TAB) };
     static PAGE:Cell<Page>=const{Cell::new(Page::Rules)};
     static STARTUP_ON:Cell<bool>=const{Cell::new(false)};
     static DARK:Cell<bool>=const{Cell::new(false)};
@@ -499,10 +502,8 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         update_rule_buttons();
                         InvalidateRect(GetDlgItem(w, id), null_mut(), 0);
                     }
-                    BASIC_TAB | SPECIAL_TAB => {
-                        if SPECIAL_GROUP.with(|v| v.replace(id == SPECIAL_TAB))
-                            != (id == SPECIAL_TAB)
-                        {
+                    BASIC_TAB | RETURN_TAB | CORNER_TAB => {
+                        if ACTIVE_TAB.replace(id) != id {
                             ui::switch_group();
                             update_rule_buttons();
                         }

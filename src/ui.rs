@@ -595,10 +595,20 @@ fn control_bounds(id: i32) -> [i32; 4] {
             [l.right - space - 94, y, 94, h]
         }
         TOGGLE => [l.right - 113, 20, 113, 34],
-        BASIC_TAB if l.roomy => [l.left + 14, l.card_top + 9, 88, 36],
-        SPECIAL_TAB if l.roomy => [l.left + 108, l.card_top + 9, 88, 36],
-        BASIC_TAB => [l.left + 10, l.card_top + 7, 80, 30],
-        SPECIAL_TAB => [l.left + 96, l.card_top + 7, 80, 30],
+        BASIC_TAB | RETURN_TAB | CORNER_TAB => {
+            let (inset, gap, width, height) = if l.roomy {
+                (14, 6, 88, 36)
+            } else {
+                (10, 5, 77, 30)
+            };
+            let column = RULE_TABS.iter().position(|&tab| tab == id).unwrap() as i32;
+            [
+                l.left + inset + column * (width + gap),
+                l.card_top + (if l.roomy { 9 } else { 7 }),
+                width,
+                height,
+            ]
+        }
         RESET_RULES if l.roomy => [l.right - 204, l.height - 58, 78, 36],
         SAVE_RULES if l.roomy => [l.right - 116, l.height - 58, 116, 36],
         RESET_RULES => [l.right - 180, l.height - 48, 68, 32],
@@ -635,9 +645,16 @@ fn control_bounds(id: i32) -> [i32; 4] {
         ],
         _ => {
             let picker = id >= PICKER;
-            let index = (id - if picker { PICKER } else { RULE_ROW }) % BASIC_COUNT as i32;
-            let x = l.left + 1 + index / 4 * l.column;
-            let y = l.row_start + index % 4 * l.row_height;
+            let index = (id - if picker { PICKER } else { RULE_ROW }) as usize;
+            let (slot, rows) = if index < BASIC_COUNT {
+                (index, 4)
+            } else if index < FIRST_CORNER {
+                (index - BASIC_COUNT, 2)
+            } else {
+                (index - FIRST_CORNER, 4)
+            };
+            let x = l.left + 1 + (slot / rows) as i32 * l.column;
+            let y = l.row_start + (slot % rows) as i32 * l.row_height;
             let (label, height, gap) = if l.roomy {
                 (132, 36, 18)
             } else {
@@ -675,7 +692,8 @@ fn controls() -> impl Iterator<Item = i32> {
         LINGER,
         RESULT,
         BASIC_TAB,
-        SPECIAL_TAB,
+        RETURN_TAB,
+        CORNER_TAB,
         RESET_RULES,
         SAVE_RULES,
     ]
@@ -697,7 +715,7 @@ fn visible_on(id: i32, page: Page) -> bool {
         ADD_APP | REMOVE_APP | SAVE_APPS | BACK | APP_LIST => page == Page::Exclusions,
         DIRTY_RULES => page == Page::Rules,
         TOGGLE => matches!(page, Page::Rules | Page::General),
-        RESET_RULES | SAVE_RULES | BASIC_TAB | SPECIAL_TAB => page == Page::Rules,
+        RESET_RULES | SAVE_RULES | BASIC_TAB | CORNER_TAB | RETURN_TAB => page == Page::Rules,
         id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
             page == Page::Rules && rule_range().contains(&((id - RULE_ROW) as usize))
         }
@@ -838,7 +856,8 @@ pub unsafe fn build() {
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
             (BASIC_TAB, "基础方向"),
-            (SPECIAL_TAB, "特殊手势"),
+            (RETURN_TAB, "往返手势"),
+            (CORNER_TAB, "转角手势"),
             (RESET_RULES, "重置本组"),
             (SAVE_RULES, "保存并重载"),
             (AUTOSTART, "启用登录自启"),
@@ -1008,12 +1027,15 @@ unsafe fn stop_slide(w: HWND, id: i32) {
 }
 fn adjacent_control(id: i32, key: usize) -> Option<i32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
-    if matches!(id, BASIC_TAB | SPECIAL_TAB) && matches!(key as u16, VK_LEFT | VK_RIGHT) {
-        return Some(if id == BASIC_TAB {
-            SPECIAL_TAB
+    if let Some(index) = RULE_TABS.iter().position(|&tab| tab == id)
+        && matches!(key as u16, VK_LEFT | VK_RIGHT)
+    {
+        let step = if key as u16 == VK_LEFT {
+            RULE_TABS.len() - 1
         } else {
-            BASIC_TAB
-        });
+            1
+        };
+        return Some(RULE_TABS[(index + step) % RULE_TABS.len()]);
     }
     let index = Page::ALL.iter().position(|p| *p as i32 == id)?;
     let len = Page::ALL.len();
@@ -1242,8 +1264,11 @@ pub unsafe fn paint(w: HWND) {
             0,
         );
         let description = match page {
-            Page::Rules if SPECIAL_GROUP.with(Cell::get) => {
-                "按住右键连续回划或转向，松开执行已绑定的动作。"
+            Page::Rules if ACTIVE_TAB.get() == RETURN_TAB => {
+                "按住右键连续回划，沿小弧线返回后松开。"
+            }
+            Page::Rules if ACTIVE_TAB.get() == CORNER_TAB => {
+                "按住右键一笔转弯。圆点是起笔位置，箭头是结束方向。"
             }
             Page::Rules => "松开右键执行绑定动作。修改绑定后点击「保存并重载」。",
             Page::General => "管理手势的运行状态、生效范围与窗口外观。",
@@ -1260,13 +1285,14 @@ pub unsafe fn paint(w: HWND) {
             0,
         );
         if page == Page::Rules {
+            let rows = rule_range().len() as i32 / 2;
             panel(
                 dc,
                 bounds(
                     l.left,
                     l.card_top,
                     l.right,
-                    l.row_start + l.row_height * 4 + 1,
+                    l.row_start + l.row_height * rows + 1,
                 ),
                 p.surface,
                 p.edge,
@@ -1281,7 +1307,7 @@ pub unsafe fn paint(w: HWND) {
                 p.muted,
                 DT_RIGHT,
             );
-            for row in 0..4 {
+            for row in 0..rows {
                 let y = l.row_start + row * l.row_height;
                 fill(dc, bounds(l.left + 1, y, l.right - 1, y + 1), p.edge);
             }
@@ -1291,7 +1317,7 @@ pub unsafe fn paint(w: HWND) {
                     l.left + 1 + l.column,
                     l.row_start + 1,
                     l.left + 2 + l.column,
-                    l.row_start + 4 * l.row_height,
+                    l.row_start + rows * l.row_height,
                 ),
                 p.edge,
             );
@@ -1443,8 +1469,8 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                     0,
                 );
             }
-        } else if id == BASIC_TAB || id == SPECIAL_TAB {
-            let active = (id == SPECIAL_TAB) == SPECIAL_GROUP.with(Cell::get);
+        } else if RULE_TABS.contains(&id) {
+            let active = id == ACTIVE_TAB.get();
             fill(dc, r, p.surface);
             rounded(
                 dc,
