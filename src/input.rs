@@ -26,16 +26,16 @@ struct PendingShortcut {
     shortcut: Shortcut,
 }
 const ACTIVATION_TIMEOUT_MS: u32 = 350;
-const WINDOW_ACTION_DELAY_MS: u32 = 180;
+pub(super) const DISPATCH_RELEASE: u32 = WM_APP + 7;
 
 #[derive(Clone, Copy)]
-struct ReleasedWindowAction {
+struct ReleasedAction {
     window: HWND,
     foreground: HWND,
     pid: u32,
     action: Action,
     released_at: u32,
-    timer: usize,
+    browser: bool,
 }
 
 struct Capture {
@@ -99,7 +99,7 @@ impl Capture {
 }
 thread_local! {
     static CAPTURE:RefCell<Option<Capture>>=const{RefCell::new(None)};
-    static RELEASED: Cell<Option<ReleasedWindowAction>> = const { Cell::new(None) };
+    static RELEASED: Cell<Option<ReleasedAction>> = const { Cell::new(None) };
     static PENDING: Cell<Option<PendingShortcut>> = const { Cell::new(None) };
     static SETTINGS_WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static PASS_THROUGH:Cell<bool>=const{Cell::new(false)};
@@ -199,7 +199,7 @@ pub unsafe extern "system" fn foreground_changed(
         && hwnd != released.foreground
         && event_time.wrapping_sub(released.released_at) as i32 >= 0
     {
-        cancel_window_action();
+        RELEASED.set(None);
     }
     // Foreground activation across input queues can complete after mouse-up.
     if let Some(pending) = PENDING.get()
@@ -246,56 +246,40 @@ fn modifiers_pressed() -> bool {
     .any(|&key| unsafe { GetAsyncKeyState(key as i32) < 0 })
 }
 
-fn cancel_window_action() {
-    if let Some(pending) = RELEASED.take() {
-        unsafe {
-            KillTimer(null_mut(), pending.timer);
-        }
-    }
-}
-
-unsafe fn schedule_window_action(target: &Target, action: Action) {
-    cancel_window_action();
+// Finish the mouse hook before issuing input to another application. Posting to
+// this listener's queue needs no timer and keeps cancellation on the same thread.
+unsafe fn queue_release(target: &Target, action: Action) {
     unsafe {
-        let timer = SetTimer(
-            null_mut(),
-            0,
-            WINDOW_ACTION_DELAY_MS,
-            Some(commit_window_action),
-        );
-        if timer != 0 {
-            RELEASED.set(Some(ReleasedWindowAction {
+        if action != Action::Unassigned
+            && PostThreadMessageW(GetCurrentThreadId(), DISPATCH_RELEASE, 0, 0) != 0
+        {
+            RELEASED.set(Some(ReleasedAction {
                 window: target.window,
                 foreground: target.foreground,
                 pid: target.pid,
                 action,
                 released_at: GetTickCount(),
-                timer,
+                browser: target.browser,
             }));
         }
     }
 }
 
-unsafe extern "system" fn commit_window_action(_: HWND, _: u32, timer: usize, _: u32) {
-    let Some(pending) = RELEASED.get().filter(|pending| pending.timer == timer) else {
+pub(super) unsafe fn dispatch_release() {
+    let Some(pending) = RELEASED.take() else {
         return;
     };
     unsafe {
-        let elapsed = GetTickCount().wrapping_sub(pending.released_at);
-        if elapsed < WINDOW_ACTION_DELAY_MS {
-            return;
-        }
-        cancel_window_action();
         let mut pid = 0;
         GetWindowThreadProcessId(pending.window, &mut pid);
-        if elapsed < 1000
+        if GetTickCount().wrapping_sub(pending.released_at) <= ACTIVATION_TIMEOUT_MS
             && pid == pending.pid
             && GetForegroundWindow() == pending.foreground
             && IsWindowEnabled(pending.window) != 0
             && IsIconic(pending.window) == 0
             && GetAsyncKeyState(VK_RBUTTON.into()) >= 0
         {
-            execute(pending.window, pending.action, false);
+            execute(pending.window, pending.action, pending.browser);
         }
     }
 }
@@ -554,7 +538,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                 | WM_MOUSEHWHEEL
         ) {
             PENDING.set(None);
-            cancel_window_action();
+            RELEASED.set(None);
         }
         match msg {
             WM_RBUTTONDOWN => {
@@ -632,12 +616,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                     } else {
                         let action = s.action(true);
                         if let Some(action) = overlay::finish(window, point, action) {
-                            if matches!(action, Action::Minimize | Action::Maximize | Action::Close)
-                            {
-                                schedule_window_action(&s.target, action);
-                            } else {
-                                execute(s.target.window, action, s.target.browser);
-                            }
+                            queue_release(&s.target, action);
                         }
                     }
                     true
@@ -685,6 +664,19 @@ mod tests {
         let mut result = Vec::new();
         loop {
             let mut msg = MSG::default();
+            // This test drives the hook on its own thread and pumps its release message here.
+            while unsafe {
+                PeekMessageW(
+                    &mut msg,
+                    null_mut(),
+                    DISPATCH_RELEASE,
+                    DISPATCH_RELEASE,
+                    PM_REMOVE,
+                )
+            } != 0
+            {
+                unsafe { dispatch_release() };
+            }
             while unsafe { PeekMessageW(&mut msg, window, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE) } != 0
             {
                 match msg.message {
@@ -980,6 +972,13 @@ mod tests {
             };
             gesture(WM_MOUSEMOVE, across);
             assert!(gesture(WM_RBUTTONUP, across));
+            assert!(keys(hwnd, 0).is_empty());
+            // A new press can overtake the posted release before the listener pumps it.
+            assert!(gesture(WM_RBUTTONDOWN, start));
+            gesture(WM_MOUSEMOVE, across);
+            assert!(gesture(WM_RBUTTONUP, across));
+            assert!(RELEASED.get().is_some());
+            assert!(!gesture(WM_LBUTTONDOWN, across));
             assert!(keys(hwnd, 0).is_empty());
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);

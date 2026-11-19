@@ -3,7 +3,7 @@ use super::*;
 use std::{
     path::PathBuf,
     process::{Child, Command},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn title(window: HWND) -> String {
@@ -87,18 +87,23 @@ impl Browser {
             r##"<!doctype html><meta charset=utf-8><title>GlideQuill action test</title>
 <style>body{height:350vh}a{position:fixed;inset:20%;display:block}</style><a autofocus href="#detail">Open detail</a>
 <script>
-function report() {
+let scrollKeyTime = 0;
+function report(event) {
   const locationName = location.hash ? 'detail' : 'index';
   const position = scrollY < 1 ? 'top' : (innerHeight + scrollY >= document.documentElement.scrollHeight - 2 ? 'end' : 'middle');
-  document.title = 'GlideQuill action test ' + locationName + '-' + position;
+  const received = event?.type === 'scrollend' && scrollKeyTime ? scrollKeyTime : Date.now();
+  document.title = 'GlideQuill action test ' + locationName + '-' + position + ' @' + received;
 }
 onhashchange = onscrollend = report;
 onload = () => requestAnimationFrame(() => requestAnimationFrame(() => { document.querySelector("a").focus(); report(); }));
 let editKey = '';
-onkeydown = e => { if (e.ctrlKey) editKey = e.code; };
+onkeydown = e => {
+  if (e.key === 'Home' || e.key === 'End') scrollKeyTime = Date.now();
+  if (e.ctrlKey) editKey = e.code;
+};
 for (const type of ['copy','paste']) document.addEventListener(type, event => {
   event.preventDefault();
-  document.title = 'GlideQuill action test ' + type + '-' + editKey; editKey = '';
+  document.title = 'GlideQuill action test ' + type + '-' + editKey + ' @' + Date.now(); editKey = '';
 });
 </script>"##,
         )
@@ -165,7 +170,7 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
             assert_eq!(GetForegroundWindow(), self.window);
         }
     }
-    fn expect_page(&self, state: &str) {
+    fn expect_page(&self, state: &str) -> u128 {
         let wanted = format!("GlideQuill action test {state}");
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(3) {
@@ -177,8 +182,14 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
                     DispatchMessageW(&msg);
                 }
             }
-            if title(self.window).contains(&wanted) {
-                return;
+            let caption = title(self.window);
+            if let Some((_, stamp)) = caption.split_once(&format!("{wanted} @")) {
+                return stamp
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -281,11 +292,11 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
             mouse_event_at(end, MOUSEEVENTF_RIGHTUP);
         }
     }
-    fn swipe(&self, dx: i32, dy: i32) {
+    fn swipe(&self, dx: i32, dy: i32) -> Instant {
         self.activate();
-        self.swipe_with_foreground(dx, dy, self.window);
+        self.swipe_with_foreground(dx, dy, self.window)
     }
-    fn swipe_with_foreground(&self, dx: i32, dy: i32, foreground: HWND) {
+    fn swipe_with_foreground(&self, dx: i32, dy: i32, foreground: HWND) -> Instant {
         unsafe {
             assert_eq!(GetForegroundWindow(), foreground);
             let center = self.exposed_point();
@@ -335,13 +346,14 @@ for (const type of ['copy','paste']) document.addEventListener(type, event => {
                 foreground,
                 "feedback changed focus before release"
             );
-            drop(held);
             assert_eq!(
                 (IsZoomed(self.window), IsIconic(self.window)),
                 (zoom, 0),
-                "window changed on release without settling"
+                "window changed while right button was held"
             );
-            overlay::refresh(crate::app_window());
+            let release = Instant::now();
+            drop(held);
+            release
         }
     }
 }
@@ -440,9 +452,26 @@ fn external_browser_actions() {
             (-120, -120, "copy-KeyC"),
             (120, 120, "paste-KeyV"),
         ] {
-            eprintln!("checking {dx}, {dy} -> {state}");
-            browser.swipe(dx, dy);
-            browser.expect_page(state);
+            let release = browser.swipe(dx, dy);
+            let received = browser.expect_page(state);
+            // History navigation can restore a cached title before a page event fires.
+            if dy == 0 {
+                eprintln!(
+                    "release to {state} navigation observed: {:.1} ms",
+                    release.elapsed().as_secs_f64() * 1000.
+                );
+                continue;
+            }
+            // Chromium can publish a title long after delivering the key. Compare
+            // the page event's timestamp with the moment we sent the mouse-up.
+            let released_at = (SystemTime::now() - release.elapsed())
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            eprintln!(
+                "release to {state} page event: {} ms",
+                received as i128 - released_at as i128
+            );
         }
         // Drive the library through the installed hook. All tabs belong to this test profile.
         let mut pack = glidequill::library::Pack {
@@ -543,7 +572,7 @@ fn external_browser_actions() {
                 assert_ne!(GetMenuState(menu, SC_RESTORE, MF_BYCOMMAND) & MF_GRAYED, 0);
             }
             for want_maximized in [false, true, false] {
-                browser.swipe(120, -120);
+                let release = browser.swipe(120, -120);
                 let start = Instant::now();
                 while (IsZoomed(browser.window) != 0) != want_maximized
                     && start.elapsed() < Duration::from_secs(2)
@@ -554,6 +583,10 @@ fn external_browser_actions() {
                     IsZoomed(browser.window) != 0,
                     want_maximized,
                     "maximize/restore (custom frame: {custom_frame})"
+                );
+                eprintln!(
+                    "release to zoom={want_maximized}: {:.1} ms",
+                    release.elapsed().as_secs_f64() * 1000.
                 );
             }
             let mut restored = RECT::default();
@@ -573,11 +606,15 @@ fn external_browser_actions() {
                 (normal.left, normal.top, normal.right, normal.bottom)
             );
             other.activate();
-            browser.swipe_with_foreground(-120, 120, other.window);
+            let release = browser.swipe_with_foreground(-120, 120, other.window);
             let start = Instant::now();
             while IsIconic(browser.window) == 0 && start.elapsed() < Duration::from_secs(2) {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            eprintln!(
+                "release to minimized: {:.1} ms",
+                release.elapsed().as_secs_f64() * 1000.
+            );
             assert_eq!(IsIconic(other.window), 0);
             assert_ne!(
                 IsIconic(browser.window),

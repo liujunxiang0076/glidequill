@@ -102,6 +102,10 @@ unsafe fn pump(stop: HANDLE) {
                 if msg.message == WM_QUIT {
                     return;
                 }
+                if msg.hwnd.is_null() && msg.message == input::DISPATCH_RELEASE {
+                    input::dispatch_release();
+                    continue;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
