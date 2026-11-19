@@ -36,6 +36,7 @@ const ADD_APP: i32 = 184;
 const REMOVE_APP: i32 = 185;
 const SAVE_APPS: i32 = 186;
 const BACK: i32 = 187;
+const ACTION_LIST: i32 = 197;
 const DIRTY_RULES: i32 = 188;
 const RESET_RULES: i32 = 136;
 const SAVE_RULES: i32 = 137;
@@ -58,14 +59,16 @@ enum Page {
     Rules = 134,
     Feedback = 135,
     Exclusions = 189,
+    Actions = 196,
 }
 impl Page {
-    const ALL: [Self; 3] = [Self::General, Self::Rules, Self::Feedback];
+    const ALL: [Self; 4] = [Self::General, Self::Rules, Self::Actions, Self::Feedback];
     fn title(self) -> &'static str {
         match self {
             Self::Exclusions => "排除的应用",
             Self::General => "常规设置",
             Self::Rules => "手势规则",
+            Self::Actions => "动作列表",
             Self::Feedback => "轨迹与字幕",
         }
     }
@@ -382,7 +385,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 item.itemHeight = ui::px(26) as u32;
                 1
             }
-            WM_CTLCOLORLISTBOX if lp as HWND == GetDlgItem(w, APP_LIST) => {
+            WM_CTLCOLORLISTBOX if matches!(GetDlgCtrlID(lp as HWND), APP_LIST | ACTION_LIST) => {
                 ui::list_background(wp as HDC) as isize
             }
             WM_DRAWITEM => {

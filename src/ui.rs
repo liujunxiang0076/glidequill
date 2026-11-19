@@ -579,6 +579,12 @@ fn control_bounds(id: i32) -> [i32; 4] {
         ADD_APP => [l.left, l.card_top, 100, 32],
         REMOVE_APP => [l.left + 110, l.card_top, 76, 32],
         BACK => [l.right - 115, 20, 115, 32],
+        ACTION_LIST => [
+            l.left + 1,
+            l.card_top + 1,
+            l.right - l.left - 2,
+            (l.height - l.card_top - 84).max(40),
+        ],
         APP_LIST => [
             l.left,
             l.card_top + 44,
@@ -685,6 +691,7 @@ fn controls() -> impl Iterator<Item = i32> {
         SAVE_APPS,
         BACK,
         APP_LIST,
+        ACTION_LIST,
         DIRTY_RULES,
         GENERAL_SCROLL,
         rules::SCOPE,
@@ -711,6 +718,7 @@ fn visible_on(id: i32, page: Page) -> bool {
         return LAYOUT.get().visible_general().contains(&index);
     }
     match id {
+        ACTION_LIST => page == Page::Actions,
         GENERAL_SCROLL => page == Page::General && LAYOUT.get().general_capacity() < 5,
         THEME_LIGHT | THEME_DARK | FULLSCREEN | EXCLUSIONS | AUTOSTART => false,
         IDLE | LINGER => page == Page::Feedback,
@@ -757,6 +765,12 @@ pub unsafe fn layout() {
     unsafe {
         let page = PAGE.get();
         sync_general_scroll();
+        SendMessageW(
+            GetDlgItem(app_window(), ACTION_LIST),
+            LB_SETITEMHEIGHT,
+            0,
+            px(if LAYOUT.get().roomy { 40 } else { 32 }) as isize,
+        );
         for id in controls() {
             place(id, visible_on(id, page), true);
             if (PICKER..PICKER + COUNT).contains(&id) {
@@ -855,6 +869,7 @@ pub unsafe fn build() {
             (BACK, "返回常规设置"),
             (Page::General as i32, Page::General.title()),
             (Page::Rules as i32, Page::Rules.title()),
+            (Page::Actions as i32, Page::Actions.title()),
             (Page::Feedback as i32, Page::Feedback.title()),
             (TOGGLE, "启用全局手势"),
             (rules::SCOPE, "通用规则  ▾"),
@@ -901,6 +916,32 @@ pub unsafe fn build() {
                 | LBS_OWNERDRAWFIXED as u32,
             control_bounds(APP_LIST),
         );
+        let catalog = control(
+            "LISTBOX",
+            "动作列表",
+            ACTION_LIST,
+            WS_TABSTOP
+                | WS_VSCROLL
+                | LBS_NOINTEGRALHEIGHT as u32
+                | LBS_HASSTRINGS as u32
+                | LBS_OWNERDRAWFIXED as u32,
+            control_bounds(ACTION_LIST),
+        );
+        for action in ACTIONS
+            .into_iter()
+            .filter(|action| *action != Action::Unassigned)
+        {
+            let name = format!(
+                "{} · {}　{}",
+                action.category(),
+                action.label(),
+                action.description()
+            );
+            let row = SendMessageW(catalog, LB_ADDSTRING, 0, wide(&name).as_ptr() as isize);
+            if row >= 0 {
+                SendMessageW(catalog, LB_SETITEMDATA, row as usize, action as isize);
+            }
+        }
         control(
             "STATIC",
             "",
@@ -1276,6 +1317,7 @@ pub unsafe fn paint(w: HWND) {
                 "按住右键一笔转弯。圆点是起笔位置，箭头是结束方向。"
             }
             Page::Rules => "松开右键执行绑定动作。修改绑定后点击「保存并重载」。",
+            Page::Actions => "在「手势规则」中选择以下动作；选择「未绑定」可单独停用一个手势。",
             Page::General => "管理手势的运行状态、生效范围与窗口外观。",
             Page::Exclusions => "按程序文件名匹配，同名程序共用一条排除规则。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
@@ -1719,6 +1761,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             let icon = match page {
                 Page::General | Page::Exclusions => "\u{e713}",
                 Page::Rules => "\u{e8fd}",
+                Page::Actions => "\u{e8a9}",
                 Page::Feedback => "\u{e7f4}",
             };
             text(
@@ -1764,6 +1807,55 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 if active { p.accent } else { p.text },
                 DT_CENTER,
             );
+        } else if id == ACTION_LIST {
+            let selected = item.itemState & ODS_SELECTED != 0;
+            fill(dc, r, if selected { p.selected } else { p.surface });
+            if item.itemID != u32::MAX
+                && let Some(action) = ACTIONS.get(item.itemData)
+            {
+                let column = |left, right| RECT {
+                    left: r.left + px(left),
+                    right,
+                    ..r
+                };
+                text(
+                    dc,
+                    action.category(),
+                    column(12, r.left + px(60)),
+                    12,
+                    Face::Body,
+                    p.muted,
+                    0,
+                );
+                text(
+                    dc,
+                    action.label(),
+                    column(66, r.left + px(174)),
+                    14,
+                    Face::Strong,
+                    p.text,
+                    0,
+                );
+                text(
+                    dc,
+                    action.description(),
+                    column(180, r.right - px(8)),
+                    13,
+                    Face::Body,
+                    p.text,
+                    0,
+                );
+                fill(
+                    dc,
+                    RECT {
+                        top: r.bottom - 1,
+                        left: r.left + px(12),
+                        right: r.right - px(12),
+                        ..r
+                    },
+                    p.edge,
+                );
+            }
         } else if id == APP_LIST {
             let selected = item.itemState & ODS_SELECTED != 0;
             fill(dc, r, if selected { p.selected } else { p.surface });

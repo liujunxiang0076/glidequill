@@ -224,6 +224,15 @@ try {
         Require ([GestureSmoke]::GetDlgItem($w,$id) -eq [IntPtr]::Zero) 'Obsolete editor control'
     }
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
+    [void](Send ([GestureSmoke]::GetDlgItem($w,196)) 0xf5)
+    $catalog=[GestureSmoke]::GetDlgItem($w,197)
+    Require ([GestureSmoke]::IsWindowVisible($catalog) -and (Send $catalog 0x18b).ToInt32() -eq 9) 'Action catalog incomplete'
+    foreach ($index in 0..8) {
+        Require ((Send $catalog 0x199 $index).ToInt32() -eq ($index+1)) 'Action catalog differs from binding options'
+    }
+    Save-Screenshot $w 'windows-actions.png'
+    [void](Send $w 0x111 134)
+    Require (![GestureSmoke]::IsWindowVisible($catalog)) 'Catalog remained visible on the binding page'
     $apply=[GestureSmoke]::GetDlgItem($w,137)
     $reset=[GestureSmoke]::GetDlgItem($w,136)
     Require (![GestureSmoke]::IsWindowEnabled($apply)) 'Clean draft enabled Save'

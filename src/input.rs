@@ -61,6 +61,8 @@ unsafe fn eligible(point: POINT) -> Option<(HWND, settings::Bindings)> {
             && rect.top <= mi.rcMonitor.top
             && rect.right >= mi.rcMonitor.right
             && rect.bottom >= mi.rcMonitor.bottom
+            // A maximized application can cover the monitor on an auto-hidden taskbar.
+            && !(IsZoomed(target) != 0 && GetWindowLongW(target, GWL_STYLE) as u32 & (WS_CAPTION | WS_MAXIMIZEBOX) != 0)
         {
             return None;
         }
@@ -181,40 +183,45 @@ unsafe fn edit_command(target: HWND, focus: HWND, copy: bool) {
     }
 }
 
-// Custom-framed applications can expose a minimize box without a system menu.
-// Ask Windows to minimize the captured window without blocking the input thread.
-unsafe fn minimize(target: HWND) {
+// Windows owns minimize/maximize placement even when an app draws its own caption.
+unsafe fn change_window_state(target: HWND, action: Action) {
     unsafe {
         let style = GetWindowLongW(target, GWL_STYLE) as u32;
-        if style & WS_MINIMIZEBOX == 0 {
-            return;
-        }
+        let (show, command) = match action {
+            Action::Minimize if style & WS_MINIMIZEBOX != 0 => (SW_MINIMIZE, SC_MINIMIZE),
+            Action::Maximize if IsZoomed(target) != 0 => (SW_RESTORE, SC_RESTORE),
+            Action::Maximize if style & WS_MAXIMIZEBOX != 0 => (SW_MAXIMIZE, SC_MAXIMIZE),
+            _ => return,
+        };
         if style & WS_SYSMENU != 0 {
             let menu = GetSystemMenu(target, 0);
             if !menu.is_null() {
-                let state = GetMenuState(menu, SC_MINIMIZE, MF_BYCOMMAND);
+                let state = GetMenuState(menu, command, MF_BYCOMMAND);
                 if state != u32::MAX && state & (MF_DISABLED | MF_GRAYED) != 0 {
                     return;
                 }
             }
         }
-        ShowWindowAsync(target, SW_MINIMIZE);
+        ShowWindowAsync(target, show);
     }
 }
 
-unsafe fn window_command(target: HWND, command: u32) {
+unsafe fn close_window(target: HWND) {
     unsafe {
         let style = GetWindowLongW(target, GWL_STYLE) as u32;
-        if style & WS_SYSMENU == 0 || (command == SC_MAXIMIZE && style & WS_MAXIMIZEBOX == 0) {
-            return;
+        if style & WS_SYSMENU == 0 {
+            // A custom-caption application may implement its own normal WM_CLOSE flow.
+            if style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX) != 0 {
+                PostMessageW(target, WM_CLOSE, 0, 0);
+            }
+        } else {
+            let menu = GetSystemMenu(target, 0);
+            if !menu.is_null()
+                && GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) & (MF_GRAYED | MF_DISABLED) == 0
+            {
+                PostMessageW(target, WM_SYSCOMMAND, SC_CLOSE as usize, 0);
+            }
         }
-        let menu = GetSystemMenu(target, 0);
-        if menu.is_null()
-            || GetMenuState(menu, command, MF_BYCOMMAND) & (MF_GRAYED | MF_DISABLED) != 0
-        {
-            return;
-        }
-        PostMessageW(target, WM_SYSCOMMAND, command as usize, 0);
     }
 }
 
@@ -233,16 +240,8 @@ unsafe fn execute(target: HWND, action: Action) {
                     edit_command(target, focus, action == Action::Copy);
                 }
             }
-            Action::Minimize => minimize(target),
-            Action::Maximize => window_command(
-                target,
-                if IsZoomed(target) != 0 {
-                    SC_RESTORE
-                } else {
-                    SC_MAXIMIZE
-                },
-            ),
-            Action::Close => window_command(target, SC_CLOSE),
+            Action::Minimize | Action::Maximize => change_window_state(target, action),
+            Action::Close => close_window(target),
             Action::Home | Action::End => {
                 let Some(focus) = focused_control(target) else {
                     return;
@@ -787,29 +786,17 @@ mod tests {
             );
             assert!(!sample.is_null());
             SetForegroundWindow(sample);
-            for (action, command) in [
-                (Action::Maximize, SC_MAXIMIZE),
-                (Action::Maximize, SC_RESTORE),
-                (Action::Close, SC_CLOSE),
-            ] {
-                if action == Action::Close {
-                    let menu = GetSystemMenu(sample, 0);
-                    EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_GRAYED);
-                    execute(sample, Action::Minimize);
-                    let mut msg = MSG::default();
-                    PeekMessageW(&mut msg, sample, 0, 0, PM_NOREMOVE);
-                    assert_eq!(IsIconic(sample), 0, "explicitly disabled minimize");
-                    EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_ENABLED);
-                }
-                execute(sample, action);
-                let messages = received(sample, WM_SYSCOMMAND);
-                assert_eq!(messages.len(), 1, "{action:?}");
-                assert_eq!(messages[0].wParam, command as usize);
-                DispatchMessageW(&messages[0]);
-                if action == Action::Maximize {
-                    assert_eq!(IsZoomed(sample) != 0, command == SC_MAXIMIZE);
-                }
-            }
+            let menu = GetSystemMenu(sample, 0);
+            EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_GRAYED);
+            execute(sample, Action::Minimize);
+            let mut msg = MSG::default();
+            PeekMessageW(&mut msg, sample, 0, 0, PM_NOREMOVE);
+            assert_eq!(IsIconic(sample), 0, "explicitly disabled minimize");
+            execute(sample, Action::Close);
+            let messages = received(sample, WM_SYSCOMMAND);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].wParam, SC_CLOSE as usize);
+            DispatchMessageW(&messages[0]);
             assert_eq!(IsWindow(sample), 0);
             overlay::destroy();
             DestroyWindow(hwnd);

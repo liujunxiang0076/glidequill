@@ -141,6 +141,28 @@ pub const DEFAULT_BINDINGS: [Action; GESTURES.len()] = {
     bindings
 };
 impl Action {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::Back | Self::Forward | Self::Home | Self::End => "导航",
+            Self::Copy | Self::Paste => "编辑",
+            Self::Minimize | Self::Maximize | Self::Close => "窗口",
+            Self::Unassigned => "绑定选项",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Back => "返回上一条浏览或文件夹历史。",
+            Self::Forward => "前往刚刚后退离开的页面或文件夹。",
+            Self::Home => "向焦点控件发送 Home，在网页正文中回到页首。",
+            Self::End => "向焦点控件发送 End，在网页正文中前往页尾。",
+            Self::Copy => "复制当前应用中选中的内容。",
+            Self::Paste => "把剪贴板内容粘贴到当前输入位置。",
+            Self::Minimize => "将起笔时的窗口收起到任务栏。",
+            Self::Maximize => "放大到工作区，再划一次恢复原来的大小。",
+            Self::Close => "请求关闭当前窗口，由应用处理保存提示。",
+            Self::Unassigned => "识别到该手势时跳过动作。",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Unassigned => "未绑定",
