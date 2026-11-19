@@ -186,7 +186,9 @@ fn set_enabled(enabled: bool, persist: bool) {
     );
 }
 fn toggle() {
-    set_enabled(LISTENER.with(|v| v.borrow().is_none()), true);
+    let was = LISTENER.with(|v| v.borrow().is_some());
+    set_enabled(!was, true);
+    ui::animate_switch(TOGGLE, was, LISTENER.with(|v| v.borrow().is_some()));
 }
 // The native selections are the draft. The listener reads only committed preferences.
 fn selected_bindings() -> Option<[Action; GESTURES.len()]> {
@@ -390,7 +392,9 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
                 if let Some(page) = Page::ALL.into_iter().find(|&p| p as i32 == id) {
-                    PAGE.with(|v| v.set(page));
+                    if PAGE.with(|v| v.replace(page)) == page {
+                        return 0;
+                    }
                     if page == Page::General
                         && let Err(e) = refresh_startup()
                     {
@@ -400,6 +404,14 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     return 0;
                 }
                 match id {
+                    id if (ui::RULE_ROW..ui::RULE_ROW + GESTURES.len() as i32).contains(&id)
+                        && wp >> 16 == STN_CLICKED as usize
+                        && CONFIG_READABLE.with(Cell::get) =>
+                    {
+                        let picker = GetDlgItem(w, ui::PICKER + (id - ui::RULE_ROW));
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(picker);
+                        SendMessageW(picker, CB_SHOWDROPDOWN, 1, 0);
+                    }
                     id if (ui::PICKER..ui::PICKER + GESTURES.len() as i32).contains(&id)
                         && matches!((wp >> 16) as u32, CBN_SELCHANGE | CBN_CLOSEUP) =>
                     {
@@ -410,7 +422,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         if SPECIAL_GROUP.with(|v| v.replace(id == SPECIAL_TAB))
                             != (id == SPECIAL_TAB)
                         {
-                            ui::layout();
+                            ui::switch_group();
                             update_rule_buttons();
                         }
                     }
@@ -424,18 +436,22 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         update_rule_buttons();
                     }
                     AUTOSTART => {
+                        let was = STARTUP_ON.with(Cell::get);
                         match refresh_startup()
                             .and_then(|on| startup::set(!on))
                             .and_then(|()| refresh_startup())
                         {
-                            Ok(on) => label(
-                                RESULT,
-                                if on {
-                                    "已开启登录自启"
-                                } else {
-                                    "已关闭登录自启"
-                                },
-                            ),
+                            Ok(on) => {
+                                ui::animate_switch(AUTOSTART, was, on);
+                                label(
+                                    RESULT,
+                                    if on {
+                                        "已开启登录自启"
+                                    } else {
+                                        "已关闭登录自启"
+                                    },
+                                )
+                            }
                             Err(e) => label(RESULT, &format!("自启设置失败：{e}")),
                         }
                     }
@@ -686,6 +702,7 @@ fn main() {
             for id in [TOGGLE, IDLE, LINGER, THEME]
                 .into_iter()
                 .chain(ui::PICKER..ui::PICKER + GESTURES.len() as i32)
+                .chain(ui::RULE_ROW..ui::RULE_ROW + GESTURES.len() as i32)
             {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                     GetDlgItem(hwnd, id),

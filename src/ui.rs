@@ -1,7 +1,8 @@
 use super::*;
+use std::time::Instant;
 use windows_sys::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
+    DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
@@ -120,6 +121,31 @@ fn colors() -> Palette {
         accent,
         selected,
         edge,
+    }
+}
+
+// Interpolate COLORREF channels independently in either theme.
+fn mix(a: u32, b: u32, amount: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((a >> shift) & 255) as f32;
+        let to = ((b >> shift) & 255) as f32;
+        ((from + (to - from) * amount).round() as u32) << shift
+    };
+    channel(0) | channel(8) | channel(16)
+}
+#[derive(Clone, Copy)]
+enum PointerState {
+    Idle,
+    Hover,
+    Pressed,
+}
+impl PointerState {
+    fn tint(self, base: u32, toward: u32) -> u32 {
+        match self {
+            Self::Idle => base,
+            Self::Hover => mix(base, toward, 0.13),
+            Self::Pressed => mix(base, toward, 0.28),
+        }
     }
 }
 
@@ -514,6 +540,34 @@ pub unsafe fn layout() {
         );
     }
 }
+pub unsafe fn switch_group() {
+    unsafe {
+        let w = app_window();
+        let visible = rule_range();
+        for index in 0..GESTURES.len() {
+            let flag = if visible.contains(&index) {
+                SWP_SHOWWINDOW
+            } else {
+                SWP_HIDEWINDOW
+            };
+            for base in [RULE_ROW, PICKER] {
+                SetWindowPos(
+                    GetDlgItem(w, base + index as i32),
+                    null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | flag,
+                );
+            }
+        }
+        let l = LAYOUT.with(Cell::get);
+        // The description, tabs and rules change together; the sidebar and footer stay put.
+        let dirty = bounds(l.left, 52, l.right, l.row_start + 4 * l.row_height + 1);
+        RedrawWindow(w, &dirty, null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
+}
 pub unsafe fn build() {
     unsafe {
         for (id, name) in [
@@ -530,13 +584,14 @@ pub unsafe fn build() {
             (IDLE, "停笔取消时间"),
             (LINGER, "松键后保留时间"),
         ] {
-            control(
+            let button = control(
                 "BUTTON",
                 name,
                 id,
                 WS_TABSTOP | BS_OWNERDRAW as u32,
                 control_bounds(id),
             );
+            SetWindowSubclass(button, Some(interactive_control), 2, id as usize);
         }
         let static_style = windows_sys::Win32::System::SystemServices::SS_OWNERDRAW;
         control(
@@ -548,7 +603,14 @@ pub unsafe fn build() {
         );
         for (index, dir) in GESTURES.iter().enumerate() {
             let id = RULE_ROW + index as i32;
-            control("STATIC", dir.name(), id, static_style, control_bounds(id));
+            let row = control(
+                "STATIC",
+                dir.name(),
+                id,
+                static_style | windows_sys::Win32::System::SystemServices::SS_NOTIFY,
+                control_bounds(id),
+            );
+            SetWindowSubclass(row, Some(interactive_control), 2, id as usize);
             let id = PICKER + index as i32;
             let field = control(
                 "COMBOBOX",
@@ -576,6 +638,7 @@ pub unsafe fn build() {
                 0,
             );
             SetWindowSubclass(field, Some(action_field), 1, 0);
+            SetWindowSubclass(field, Some(interactive_control), 2, id as usize);
         }
     }
 }
@@ -585,12 +648,153 @@ unsafe fn caption(w: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 thread_local! {
-    static HOVER_FIELD: Cell<HWND> = const { Cell::new(null_mut()) };
+    static HOT_CONTROL: Cell<HWND> = const { Cell::new(null_mut()) };
     static PRESSED_CLEAR: Cell<HWND> = const { Cell::new(null_mut()) };
+}
+const SLIDE_TIMER: usize = 6;
+const SLIDE_SECONDS: f32 = 0.16;
+#[derive(Clone, Copy)]
+struct Slide {
+    start: Instant,
+    from: f32,
+    to: f32,
+}
+impl Slide {
+    fn position(self) -> f32 {
+        let t = (self.start.elapsed().as_secs_f32() / SLIDE_SECONDS).min(1.0);
+        self.from + (self.to - self.from) * (1.0 - (1.0 - t) * (1.0 - t))
+    }
+}
+thread_local! { static SLIDES: [Cell<Option<Slide>>;2] = const {[Cell::new(None), Cell::new(None)]}; }
+fn switch_position(id: i32, on: bool) -> f32 {
+    SLIDES
+        .with(|slots| slots[usize::from(id == AUTOSTART)].get())
+        .map_or(f32::from(on), Slide::position)
+}
+pub fn animate_switch(id: i32, was: bool, on: bool) {
+    if was == on {
+        return;
+    }
+    unsafe {
+        let w = GetDlgItem(app_window(), id);
+        let mut motion: i32 = 0;
+        if IsWindowVisible(w) == 0
+            || SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                (&mut motion as *mut i32).cast(),
+                0,
+            ) == 0
+            || motion == 0
+        {
+            stop_slide(w, id);
+            return;
+        }
+        let slide = Slide {
+            start: Instant::now(),
+            from: switch_position(id, was),
+            to: f32::from(on),
+        };
+        if SetTimer(w, SLIDE_TIMER, 16, None) != 0 {
+            SLIDES.with(|slots| slots[usize::from(id == AUTOSTART)].set(Some(slide)));
+            InvalidateRect(w, null_mut(), 0);
+        }
+    }
+}
+unsafe fn stop_slide(w: HWND, id: i32) {
+    unsafe {
+        KillTimer(w, SLIDE_TIMER);
+    }
+    SLIDES.with(|slots| slots[usize::from(id == AUTOSTART)].set(None));
+}
+fn adjacent_control(id: i32, key: usize) -> Option<i32> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP};
+    if matches!(id, BASIC_TAB | SPECIAL_TAB) && matches!(key as u16, VK_LEFT | VK_RIGHT) {
+        return Some(if id == BASIC_TAB {
+            SPECIAL_TAB
+        } else {
+            BASIC_TAB
+        });
+    }
+    let index = Page::ALL.iter().position(|p| *p as i32 == id)?;
+    let len = Page::ALL.len();
+    let next = match key as u16 {
+        VK_UP => (index + len - 1) % len,
+        VK_DOWN => (index + 1) % len,
+        _ => return None,
+    };
+    Some(Page::ALL[next] as i32)
+}
+unsafe extern "system" fn interactive_control(
+    w: HWND,
+    m: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _subclass: usize,
+    data: usize,
+) -> LRESULT {
+    unsafe {
+        let id = data as i32;
+        match m {
+            WM_MOUSEMOVE if HOT_CONTROL.with(Cell::get) != w => {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: w,
+                    ..Default::default()
+                };
+                if TrackMouseEvent(&mut track) != 0 {
+                    let previous = HOT_CONTROL.with(|v| v.replace(w));
+                    if !previous.is_null() {
+                        InvalidateRect(previous, null_mut(), 0);
+                    }
+                    InvalidateRect(w, null_mut(), 0);
+                }
+            }
+            WM_MOUSELEAVE if HOT_CONTROL.with(Cell::get) == w => {
+                HOT_CONTROL.with(|v| v.set(null_mut()));
+                InvalidateRect(w, null_mut(), 0);
+            }
+            WM_SHOWWINDOW if wp == 0 => {
+                if HOT_CONTROL.with(Cell::get) == w {
+                    HOT_CONTROL.with(|hot| hot.set(null_mut()));
+                }
+                if matches!(id, TOGGLE | AUTOSTART) {
+                    stop_slide(w, id);
+                }
+            }
+            WM_TIMER if wp == SLIDE_TIMER && matches!(id, TOGGLE | AUTOSTART) => {
+                let slide = SLIDES.with(|slots| slots[usize::from(id == AUTOSTART)].get());
+                if slide.is_none_or(|s| s.start.elapsed().as_secs_f32() >= SLIDE_SECONDS) {
+                    stop_slide(w, id);
+                }
+                InvalidateRect(w, null_mut(), 0);
+                return 0;
+            }
+            WM_GETDLGCODE if adjacent_control(id, wp).is_some() => {
+                return DefSubclassProc(w, m, wp, lp) | DLGC_WANTARROWS as isize;
+            }
+            WM_KEYDOWN => {
+                let Some(next_id) = adjacent_control(id, wp) else {
+                    return DefSubclassProc(w, m, wp, lp);
+                };
+                let next = GetDlgItem(app_window(), next_id);
+                SetFocus(next);
+                SendMessageW(next, BM_CLICK, 0, 0);
+                return 0;
+            }
+            WM_SETCURSOR if IsWindowEnabled(w) != 0 && (lp as u16) == HTCLIENT as u16 => {
+                SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+                return 1;
+            }
+            _ => {}
+        }
+        DefSubclassProc(w, m, wp, lp)
+    }
 }
 unsafe fn clear_target(w: HWND) -> Option<RECT> {
     unsafe {
-        if HOVER_FIELD.with(Cell::get) != w
+        if HOT_CONTROL.with(Cell::get) != w
             || IsWindowEnabled(w) == 0
             || SendMessageW(w, CB_GETCURSEL, 0, 0) <= Action::Unassigned as isize
             || SendMessageW(w, CB_GETDROPPEDSTATE, 0, 0) != 0
@@ -622,25 +826,6 @@ unsafe extern "system" fn action_field(
 ) -> LRESULT {
     unsafe {
         match m {
-            WM_MOUSEMOVE if HOVER_FIELD.with(Cell::get) != w => {
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: w,
-                    ..Default::default()
-                };
-                if TrackMouseEvent(&mut track) != 0 {
-                    let previous = HOVER_FIELD.with(|v| v.replace(w));
-                    if !previous.is_null() {
-                        InvalidateRect(previous, null_mut(), 0);
-                    }
-                    InvalidateRect(w, null_mut(), 0);
-                }
-            }
-            WM_MOUSELEAVE if HOVER_FIELD.with(Cell::get) == w => {
-                HOVER_FIELD.with(|v| v.set(null_mut()));
-                InvalidateRect(w, null_mut(), 0);
-            }
             WM_LBUTTONDOWN if hits_clear(w, lp) => {
                 SetFocus(w);
                 SetCapture(w);
@@ -679,12 +864,29 @@ unsafe extern "system" fn action_field(
             let p = colors();
             let focus = GetFocus() == w;
             fill(dc, r, p.surface);
-            panel(dc, r, p.surface, if focus { p.accent } else { p.edge }, 5);
+            let hot = HOT_CONTROL.with(Cell::get) == w;
+            let open = SendMessageW(w, CB_GETDROPPEDSTATE, 0, 0) != 0;
+            let border = if focus || open {
+                p.accent
+            } else if hot {
+                mix(p.edge, p.accent, 0.55)
+            } else {
+                p.edge
+            };
+            panel(dc, r, p.surface, border, 5);
             let chevron = RECT {
                 left: r.right - px(23),
                 ..r
             };
-            text(dc, "\u{e70d}", chevron, 11, Face::Icon, p.muted, DT_CENTER);
+            text(
+                dc,
+                if open { "\u{e70e}" } else { "\u{e70d}" },
+                chevron,
+                11,
+                Face::Icon,
+                p.muted,
+                DT_CENTER,
+            );
             r.left += px(9);
             r.right = if let Some(clear) = clear_target(w) {
                 if PRESSED_CLEAR.with(Cell::get) == w {
@@ -844,6 +1046,15 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         let id = item.CtlID as i32;
         let dc = item.hDC;
         let r = item.rcItem;
+        let state = if item.itemState & ODS_DISABLED != 0 {
+            PointerState::Idle
+        } else if item.itemState & ODS_SELECTED != 0 {
+            PointerState::Pressed
+        } else if HOT_CONTROL.with(Cell::get) == item.hwndItem {
+            PointerState::Hover
+        } else {
+            PointerState::Idle
+        };
         if (RULE_ROW..RULE_ROW + COUNT).contains(&id) {
             let dir = GESTURES[(id - RULE_ROW) as usize];
             fill(dc, r, p.surface);
@@ -855,7 +1066,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 right: px(10) + side,
                 bottom: top + side,
             };
-            rounded(dc, tile, p.selected, 7);
+            rounded(dc, tile, state.tint(p.selected, p.accent), 7);
             if let Some((a, b)) = dir.legs() {
                 draw_turn(dc, tile, a, b, p.accent);
             } else {
@@ -890,9 +1101,12 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         } else if id == BASIC_TAB || id == SPECIAL_TAB {
             let active = (id == SPECIAL_TAB) == SPECIAL_GROUP.with(Cell::get);
             fill(dc, r, p.surface);
-            if active {
-                rounded(dc, r, p.selected, 5);
-            }
+            rounded(
+                dc,
+                r,
+                state.tint(if active { p.selected } else { p.surface }, p.accent),
+                5,
+            );
             text(
                 dc,
                 &caption(item.hwndItem),
@@ -908,14 +1122,11 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         } else if matches!(id, RESET_RULES | SAVE_RULES) {
             let enabled = IsWindowEnabled(item.hwndItem) != 0;
             let primary = enabled && id == SAVE_RULES;
-            let pressed = item.itemState & ODS_SELECTED != 0;
             fill(dc, r, p.base);
-            let background = if pressed {
-                p.selected
-            } else if primary {
-                p.accent
+            let background = if primary {
+                state.tint(p.accent, p.text)
             } else if enabled {
-                p.surface
+                state.tint(p.surface, p.accent)
             } else if id == SAVE_RULES {
                 p.edge
             } else {
@@ -928,9 +1139,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 if primary { p.accent } else { p.edge },
                 6,
             );
-            let ink = if pressed {
-                p.accent
-            } else if primary {
+            let ink = if primary {
                 p.surface
             } else if enabled {
                 p.text
@@ -954,22 +1163,11 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             } else {
                 LISTENER.with(|v| v.borrow().is_some())
             };
-            rounded(
-                dc,
-                bounds(79, 9, 111, 26),
-                if on { p.accent } else { p.muted },
-                9,
-            );
-            rounded(
-                dc,
-                if on {
-                    bounds(96, 11, 109, 24)
-                } else {
-                    bounds(81, 11, 94, 24)
-                },
-                p.surface,
-                7,
-            );
+            let progress = switch_position(id, on);
+            let track = state.tint(mix(p.muted, p.accent, progress), p.text);
+            rounded(dc, bounds(76, 7, 112, 27), track, 10);
+            let x = 78 + (16.0 * progress).round() as i32;
+            rounded(dc, bounds(x, 9, x + 16, 25), p.surface, 8);
             text(
                 dc,
                 if !settings {
@@ -991,7 +1189,13 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             );
         } else if id == IDLE || id == LINGER {
             fill(dc, r, p.surface);
-            panel(dc, r, p.base, p.edge, 6);
+            panel(
+                dc,
+                r,
+                state.tint(p.base, p.accent),
+                state.tint(p.edge, p.accent),
+                6,
+            );
             let prefs = settings::preferences();
             let ms = if id == IDLE {
                 prefs.idle_ms
@@ -1019,10 +1223,13 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         } else if let Some(page) = Page::ALL.into_iter().find(|&page| page as i32 == id) {
             let selected = PAGE.with(Cell::get) == page;
             fill(dc, r, p.rail);
-            if selected || item.itemState & ODS_SELECTED != 0 {
-                rounded(dc, r, p.selected, 7);
-            }
-            let color = if selected { p.accent } else { p.text };
+            let background = if selected {
+                state.tint(p.accent, p.text)
+            } else {
+                state.tint(p.rail, p.accent)
+            };
+            rounded(dc, r, background, 7);
+            let color = if selected { p.surface } else { p.text };
             let icon = match page {
                 Page::General => "\u{e713}",
                 Page::Rules => "\u{e8fd}",
@@ -1050,7 +1257,13 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             }
         } else if id == THEME {
             fill(dc, r, p.surface);
-            panel(dc, r, p.base, p.edge, 6);
+            panel(
+                dc,
+                r,
+                state.tint(p.base, p.accent),
+                state.tint(p.edge, p.accent),
+                6,
+            );
             let icon = if DARK.with(Cell::get) {
                 "\u{e706}"
             } else {
@@ -1075,7 +1288,9 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 0,
             );
         }
-        if item.itemState & ODS_FOCUS != 0 {
+        if item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT) == ODS_FOCUS
+            && SendMessageW(item.hwndItem, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0
+        {
             DrawFocusRect(dc, &inset(r, px(2)));
         }
     }
