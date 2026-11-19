@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, ReleaseCapture, SetCapture};
 
+use windows_sys::Win32::UI::HiDpi::*;
+
 mod engine;
 mod input;
 mod settings;
@@ -31,6 +33,7 @@ const BROWSER: i32 = 126;
 const CLASS: &str = "GlideQuill.Rules.0.1";
 thread_local! {
     static TEST_INSTANCE:Cell<bool>=const{Cell::new(false)};
+    static CONFIG_READABLE:Cell<bool>=const{Cell::new(true)};
     static DARK:Cell<bool>=const{Cell::new(false)};
     static TRAIL:RefCell<Vec<POINT>>=const{RefCell::new(Vec::new())};
     static WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
@@ -48,12 +51,14 @@ fn wide(s: &str) -> Vec<u16> {
 }
 fn label(id: i32, s: &str) {
     unsafe {
-        SetWindowTextW(GetDlgItem(app_window(), id), wide(s).as_ptr());
+        let child = GetDlgItem(app_window(), id);
+        SetWindowTextW(child, wide(s).as_ptr());
+        InvalidateRect(child, null_mut(), 0);
     }
 }
 unsafe fn control(class: &str, s: &str, id: i32, style: u32, area: [i32; 4]) -> HWND {
     unsafe {
-        let [x, y, w, h] = area;
+        let [x, y, w, h] = area.map(ui::px);
         let hwnd = CreateWindowExW(
             0,
             wide(class).as_ptr(),
@@ -116,6 +121,20 @@ fn read_rules(c: &mut Config) {
         }
     }
 }
+fn dirty_rules() -> bool {
+    let active = settings::snapshot();
+    let mut draft = (*active).clone();
+    read_rules(&mut draft);
+    draft.global != active.global || draft.browser != active.browser
+}
+fn update_save() {
+    unsafe {
+        EnableWindow(
+            GetDlgItem(app_window(), SAVE),
+            (CONFIG_READABLE.with(Cell::get) && dirty_rules()).into(),
+        );
+    }
+}
 fn toggle() {
     let active = LISTENER.with(|v| v.borrow_mut().take());
     if let Some(listener) = active {
@@ -141,7 +160,7 @@ unsafe fn notify(op: u32) -> bool {
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: TRAY,
-            hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
+            hIcon: GetClassLongPtrW(app_window(), GCLP_HICON) as HICON,
             ..Default::default()
         };
         let tip = wide("GlideQuill · 拂标");
@@ -151,8 +170,8 @@ unsafe fn notify(op: u32) -> bool {
 }
 unsafe extern "system" fn pad_proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
-        let x = i32::from(lp as i16);
-        let y = i32::from((lp >> 16) as i16);
+        let x = ui::dip(i32::from(lp as i16));
+        let y = ui::dip(i32::from((lp >> 16) as i16));
         match m {
             WM_RBUTTONDOWN => {
                 SetCapture(w);
@@ -212,20 +231,7 @@ unsafe extern "system" fn pad_proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 let dc = BeginPaint(w, &mut ps);
                 let mut r = RECT::default();
                 GetClientRect(w, &mut r);
-                SetBkMode(dc, TRANSPARENT as i32);
-                let dark = DARK.with(Cell::get);
-                ui::pad_background(dc, r, TRAIL.with(|t| t.borrow().len() < 2));
-                TRAIL.with(|trail| {
-                    let trail = trail.borrow();
-                    if trail.len() > 1 {
-                        let pen =
-                            CreatePen(PS_SOLID, 3, if dark { 0x00FFCCA4 } else { 0x00A25324 });
-                        let old = SelectObject(dc, pen);
-                        Polyline(dc, trail.as_ptr(), trail.len() as i32);
-                        SelectObject(dc, old);
-                        DeleteObject(pen);
-                    }
-                });
+                TRAIL.with(|t| ui::paint_pad(dc, r, &t.borrow()));
                 EndPaint(w, &ps);
                 0
             }
@@ -238,8 +244,10 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
         match m {
             WM_CREATE => {
                 WINDOW.with(|v| v.set(w));
+                ui::set_dpi(GetDpiForWindow(w));
                 ui::build();
                 populate();
+                update_save();
                 TASKBAR.with(|id| id.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr())));
                 TRAY_OK.with(|ok| ok.set(notify(NIM_ADD)));
                 0
@@ -249,10 +257,26 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_ERASEBKGND => 1,
-            WM_CTLCOLORSTATIC => ui::static_style(wp as HDC),
+            WM_DPICHANGED => {
+                let dpi = (wp & 0xffff) as u32;
+                ui::set_dpi(dpi);
+                let suggested = &*(lp as *const RECT);
+                let frame = frame_size(dpi);
+                SetWindowPos(
+                    w,
+                    null_mut(),
+                    suggested.left,
+                    suggested.top,
+                    frame.right - frame.left,
+                    frame.bottom - frame.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                ui::layout();
+                0
+            }
             WM_MEASUREITEM => {
                 let item = &mut *(lp as *mut windows_sys::Win32::UI::Controls::MEASUREITEMSTRUCT);
-                item.itemHeight = 24;
+                item.itemHeight = ui::px(26) as u32;
                 1
             }
             WM_DRAWITEM => {
@@ -263,10 +287,10 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 let id = (wp & 0xffff) as i32;
                 match id {
                     SCOPE | BROWSER => {
-                        let mut draft = (*settings::snapshot()).clone();
-                        read_rules(&mut draft);
-                        let active = settings::snapshot();
-                        if (draft.global != active.global || draft.browser != active.browser)
+                        if (id == BROWSER) == GROUP.with(Cell::get) {
+                            return 0;
+                        }
+                        if dirty_rules()
                             && MessageBoxW(
                                 w,
                                 wide("切换范围将放弃未保存的修改，继续？").as_ptr(),
@@ -279,6 +303,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         GROUP.with(|v| v.set(id == BROWSER));
                         RedrawWindow(w, null_mut(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
                         populate();
+                        update_save();
                         label(
                             RESULT,
                             if id == BROWSER {
@@ -288,21 +313,35 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             },
                         );
                     }
-                    SAVE => {
+                    SAVE if CONFIG_READABLE.with(Cell::get) && dirty_rules() => {
                         let mut c = (*settings::snapshot()).clone();
                         read_rules(&mut c);
                         match settings::apply(c) {
                             Ok(()) => {
+                                update_save();
                                 label(RESULT, "已保存 · 当前规则立即生效");
                             }
                             Err(e) => label(RESULT, &format!("保存失败：{e}")),
                         }
+                    }
+                    id if (FIRST..FIRST + 4).contains(&id)
+                        && (wp >> 16) == CBN_SELCHANGE as usize =>
+                    {
+                        update_save()
                     }
                     THEME => {
                         let dark = DARK.with(|d| {
                             d.set(!d.get());
                             d.get()
                         });
+                        use windows_sys::Win32::Graphics::Dwm::*;
+                        let use_dark = i32::from(dark);
+                        DwmSetWindowAttribute(
+                            w,
+                            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                            (&use_dark as *const i32).cast(),
+                            size_of::<i32>() as u32,
+                        );
                         label(THEME, if dark { "浅色" } else { "深色" });
                         RedrawWindow(
                             w,
@@ -372,8 +411,23 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
         }
     }
 }
+const WINDOW_STYLE: u32 =
+    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+unsafe fn frame_size(dpi: u32) -> RECT {
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: ui::px(ui::WIDTH),
+        bottom: ui::px(ui::HEIGHT),
+    };
+    unsafe {
+        AdjustWindowRectExForDpi(&mut frame, WINDOW_STYLE, 0, 0, dpi);
+    }
+    frame
+}
 fn main() {
     unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let test_id = std::env::var("GLIDEQUILL_UI_TEST_ID")
             .ok()
             .filter(|id| id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
@@ -405,10 +459,22 @@ fn main() {
         }
         let cfg = settings::load();
         let error = cfg.as_ref().err().map(ToString::to_string);
+        CONFIG_READABLE.with(|v| v.set(error.is_none()));
         if let Ok(c) = cfg {
             settings::initialize(c)
         }
+        let _graphics = ui::GraphicsSession::start();
         let inst = GetModuleHandleW(null_mut());
+        let image = include_bytes!("quill.png");
+        let icon = CreateIconFromResourceEx(
+            image.as_ptr(),
+            image.len() as u32,
+            1,
+            0x30000,
+            96,
+            96,
+            LR_DEFAULTCOLOR,
+        );
         let pad = wide("GlideQuill.Practice");
         for (name, handler, brush) in [
             (
@@ -420,6 +486,7 @@ fn main() {
         ] {
             let wc = WNDCLASSW {
                 hInstance: inst,
+                hIcon: icon,
                 lpszClassName: name.as_ptr(),
                 lpfnWndProc: handler,
                 hCursor: LoadCursorW(null_mut(), IDC_ARROW),
@@ -430,23 +497,14 @@ fn main() {
                 return;
             }
         }
-        let mut frame = RECT {
-            left: 0,
-            top: 0,
-            right: ui::WIDTH,
-            bottom: ui::HEIGHT,
-        };
-        AdjustWindowRectEx(
-            &mut frame,
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-            0,
-            0,
-        );
+        let dpi = GetDpiForSystem();
+        ui::set_dpi(dpi);
+        let frame = frame_size(dpi);
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
             wide("GlideQuill · 手势规则").as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            WINDOW_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             frame.right - frame.left,
@@ -458,6 +516,19 @@ fn main() {
         );
         if hwnd.is_null() {
             return;
+        }
+        let actual_dpi = GetDpiForWindow(hwnd);
+        if actual_dpi != dpi {
+            let actual = frame_size(actual_dpi);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                0,
+                0,
+                actual.right - actual.left,
+                actual.bottom - actual.top,
+                SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE,
+            );
         }
         if let Some(e) = error {
             label(RESULT, &format!("配置读取失败，已暂停：{e}"));

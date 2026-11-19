@@ -4,7 +4,7 @@ Windows x64 鼠标手势工具，Rust + Win32。0.1.0 是第一版可运行雏�
 
 ## 实际 Windows 界面
 
-左侧选择通用规则或浏览器范围，右侧直接编辑四个方向的动作并保存。底部练习区显示当前规则的匹配结果。[浅色窗口](docs/windows-light.png) · [深色窗口](docs/windows-dark.png)
+窗口按所在显示器的 DPI 绘制。左侧切换规则范围、全局监听和外观，右侧按方向编辑绑定，有修改时可保存。下方点阵区可试画并查看当前草稿的匹配结果。[浅色窗口](docs/windows-light.png) · [深色窗口](docs/windows-dark.png)
 
 ## 本地试用
 

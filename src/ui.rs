@@ -1,14 +1,44 @@
 use super::*;
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
+use windows_sys::Win32::Graphics::GdiPlus::*;
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
 
-// Logical 96-DPI coordinates; Windows scales the entire window on high-DPI desktops.
+// Layout is in device-independent pixels. Convert once at each drawing/Win32 boundary.
 pub const WIDTH: i32 = 812;
 pub const HEIGHT: i32 = 552;
-const SIDEBAR: i32 = 180;
-const LEFT: i32 = 208;
-const RIGHT: i32 = 784;
-const TOP: i32 = 155;
-const ROW: i32 = 48;
+const RAIL: i32 = 168;
+const LEFT: i32 = RAIL + 28;
+const RIGHT: i32 = WIDTH - 28;
+const FIELD: i32 = 536;
+const TOP: i32 = 130;
+const ROW: i32 = 54;
+thread_local! { static DPI: Cell<u32> = const { Cell::new(96) }; }
+pub fn set_dpi(dpi: u32) {
+    DPI.with(|v| v.set(if dpi == 0 { 96 } else { dpi }));
+}
+pub fn px(dip: i32) -> i32 {
+    DPI.with(|dpi| (dip as f64 * dpi.get() as f64 / 96.0).round() as i32)
+}
+pub fn dip(pixel: i32) -> i32 {
+    DPI.with(|dpi| (pixel as f64 * 96.0 / dpi.get() as f64).round() as i32)
+}
+fn bounds(x: i32, y: i32, right: i32, bottom: i32) -> RECT {
+    RECT {
+        left: px(x),
+        top: px(y),
+        right: px(right),
+        bottom: px(bottom),
+    }
+}
+fn inset(mut r: RECT, amount: i32) -> RECT {
+    r.left += amount;
+    r.top += amount;
+    r.right -= amount;
+    r.bottom -= amount;
+    r
+}
+fn rgb(v: u32) -> u32 {
+    (v >> 16) | (v & 0xff00) | ((v & 255) << 16)
+}
 
 struct Palette {
     base: u32,
@@ -19,18 +49,30 @@ struct Palette {
     accent: u32,
     selected: u32,
     edge: u32,
-}
-fn rgb(v: u32) -> u32 {
-    (v >> 16) | (v & 0xff00) | ((v & 255) << 16)
+    ink: u32,
+    grid: u32,
 }
 fn colors() -> Palette {
-    let [base, rail, surface, text, muted, accent, selected, edge] = if DARK.with(Cell::get) {
+    let [
+        base,
+        rail,
+        surface,
+        text,
+        muted,
+        accent,
+        selected,
+        edge,
+        ink,
+        grid,
+    ] = if DARK.with(Cell::get) {
         [
-            0x191d26, 0x141821, 0x242936, 0xe9edf6, 0xb3bdcd, 0xa4beff, 0x303f60, 0x354052,
+            0x171b22, 0x1c212a, 0x242a34, 0xeff3fa, 0xaeb8c8, 0xa3beff, 0x303e58, 0x38404e,
+            0x182a4a, 0x414b5b,
         ]
     } else {
         [
-            0xf5f6f9, 0xe9ecf2, 0xffffff, 0x202737, 0x546074, 0x2453b6, 0xe3ebfc, 0xdce2ed,
+            0xf6f7f9, 0xfcfcfd, 0xffffff, 0x1e2735, 0x596577, 0x325dab, 0xeaf0fc, 0xdbe0e8,
+            0xffffff, 0xd7dfe9,
         ]
     }
     .map(rgb);
@@ -43,48 +85,106 @@ fn colors() -> Palette {
         accent,
         selected,
         edge,
+        ink,
+        grid,
     }
 }
-fn rect(x: i32, y: i32, r: i32, b: i32) -> RECT {
-    RECT {
-        left: x,
-        top: y,
-        right: r,
-        bottom: b,
+
+// Keep GDI+ active for the lifetime of the native window and its child controls.
+pub struct GraphicsSession(usize);
+impl GraphicsSession {
+    pub fn start() -> Self {
+        let mut token = 0;
+        let input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        unsafe {
+            GdiplusStartup(&mut token, &input, null_mut());
+        }
+        Self(token)
     }
 }
-unsafe fn fill(dc: HDC, r: RECT, c: u32) {
+impl Drop for GraphicsSession {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { GdiplusShutdown(self.0) };
+        }
+    }
+}
+unsafe fn fill(dc: HDC, r: RECT, color: u32) {
     unsafe {
-        SetDCBrushColor(dc, c);
+        SetDCBrushColor(dc, color);
         FillRect(dc, &r, GetStockObject(DC_BRUSH));
     }
 }
-unsafe fn rounded(dc: HDC, r: RECT, c: u32, radius: i32) {
+unsafe fn rounded(dc: HDC, r: RECT, color: u32, radius: i32) {
     unsafe {
-        SetDCBrushColor(dc, c);
-        let brush = SelectObject(dc, GetStockObject(DC_BRUSH));
-        let pen = SelectObject(dc, GetStockObject(NULL_PEN));
-        RoundRect(
-            dc,
-            r.left,
-            r.top,
-            r.right + 1,
-            r.bottom + 1,
-            radius * 2,
-            radius * 2,
-        );
-        SelectObject(dc, pen);
-        SelectObject(dc, brush);
+        let mut graphics = null_mut();
+        let mut path = null_mut();
+        let mut brush = null_mut();
+        if GdipCreateFromHDC(dc, &mut graphics) == Ok
+            && GdipCreatePath(FillModeAlternate, &mut path) == Ok
+            && GdipCreateSolidFill(0xff000000 | rgb(color), &mut brush) == Ok
+        {
+            let d = (px(radius) * 2).min(r.right - r.left).min(r.bottom - r.top) as f32;
+            let (x, y, right, bottom) =
+                (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+            for (ax, ay, angle) in [
+                (x, y, 180.),
+                (right - d, y, 270.),
+                (right - d, bottom - d, 0.),
+                (x, bottom - d, 90.),
+            ] {
+                GdipAddPathArc(path, ax, ay, d, d, angle, 90.);
+            }
+            GdipClosePathFigure(path);
+            GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+            GdipFillPath(graphics, brush.cast(), path);
+        } else {
+            fill(dc, r, color);
+        }
+        if !brush.is_null() {
+            GdipDeleteBrush(brush.cast());
+        }
+        if !path.is_null() {
+            GdipDeletePath(path);
+        }
+        if !graphics.is_null() {
+            GdipDeleteGraphics(graphics);
+        }
     }
 }
-unsafe fn text(dc: HDC, s: &str, r: RECT, size: i32, bold: bool, color: u32, align: u32) {
+unsafe fn panel(dc: HDC, r: RECT, background: u32, edge: u32, radius: i32) {
     unsafe {
+        rounded(dc, r, edge, radius);
+        rounded(dc, inset(r, 1), background, radius);
+    }
+}
+enum Face {
+    Body,
+    Strong,
+    Brand,
+    Icon,
+}
+unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u32, align: u32) {
+    unsafe {
+        let family = match face {
+            Face::Icon => "Segoe MDL2 Assets",
+            Face::Brand => "Segoe UI",
+            _ => "Microsoft YaHei UI",
+        };
+        let weight = if matches!(face, Face::Strong | Face::Brand) {
+            600
+        } else {
+            400
+        };
         let font = CreateFontW(
-            -size,
+            -px(size),
             0,
             0,
             0,
-            if bold { 600 } else { 400 },
+            weight,
             0,
             0,
             0,
@@ -93,25 +193,183 @@ unsafe fn text(dc: HDC, s: &str, r: RECT, size: i32, bold: bool, color: u32, ali
             0,
             CLEARTYPE_QUALITY as u32,
             0,
-            wide("Microsoft YaHei UI").as_ptr(),
+            wide(family).as_ptr(),
         );
         let old = SelectObject(dc, font);
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, color);
-        let mut area = r;
-        let mut buf = wide(s);
-        DrawTextW(
-            dc,
-            buf.as_mut_ptr(),
-            -1,
-            &mut area,
-            DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | align,
-        );
+        let mut graphics = null_mut();
+        let mut glyph_font = null_mut();
+        let mut brush = null_mut();
+        let mut format = null_mut();
+        let label = wide(s);
+        let layout = RectF {
+            X: area.left as f32,
+            Y: area.top as f32,
+            Width: (area.right - area.left) as f32,
+            Height: (area.bottom - area.top) as f32,
+        };
+        let drawn = GdipCreateFromHDC(dc, &mut graphics) == Ok
+            && GdipCreateFontFromDC(dc, &mut glyph_font) == Ok
+            && GdipCreateSolidFill(0xff000000 | rgb(color), &mut brush) == Ok
+            && GdipCreateStringFormat(StringFormatFlagsNoWrap, 0, &mut format) == Ok
+            && {
+                GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAliasGridFit);
+                GdipSetStringFormatAlign(
+                    format,
+                    if align == DT_CENTER {
+                        StringAlignmentCenter
+                    } else {
+                        StringAlignmentNear
+                    },
+                );
+                GdipSetStringFormatLineAlign(format, StringAlignmentCenter);
+                GdipSetStringFormatTrimming(format, StringTrimmingEllipsisCharacter);
+                GdipDrawString(
+                    graphics,
+                    label.as_ptr(),
+                    -1,
+                    glyph_font,
+                    &layout,
+                    format,
+                    brush.cast(),
+                ) == Ok
+            };
+        if !format.is_null() {
+            GdipDeleteStringFormat(format);
+        }
+        if !brush.is_null() {
+            GdipDeleteBrush(brush.cast());
+        }
+        if !glyph_font.is_null() {
+            GdipDeleteFont(glyph_font);
+        }
+        if !graphics.is_null() {
+            GdipDeleteGraphics(graphics);
+        }
+        if !drawn {
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, color);
+            DrawTextW(
+                dc,
+                wide(s).as_mut_ptr(),
+                -1,
+                &mut area,
+                DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | align,
+            );
+        }
         SelectObject(dc, old);
         DeleteObject(font);
     }
 }
-// Leave input, accessibility and the popup list to the native combo box.
+fn control_bounds(id: i32) -> [i32; 4] {
+    match id {
+        SCOPE => [12, 100, 144, 36],
+        BROWSER => [12, 140, 144, 36],
+        THEME => [12, HEIGHT - 50, 144, 36],
+        TOGGLE => [12, HEIGHT - 93, 144, 36],
+        SAVE => [RIGHT - 94, 30, 94, 34],
+        PAD => [LEFT, 402, RIGHT - LEFT, 96],
+        RESULT => [LEFT, 506, RIGHT - LEFT, 28],
+        _ => [
+            FIELD,
+            TOP + (id - FIRST) * ROW + 12,
+            RIGHT - FIELD - 18,
+            330,
+        ],
+    }
+}
+pub unsafe fn layout() {
+    unsafe {
+        for id in [
+            SCOPE,
+            BROWSER,
+            THEME,
+            TOGGLE,
+            SAVE,
+            PAD,
+            RESULT,
+            FIRST,
+            FIRST + 1,
+            FIRST + 2,
+            FIRST + 3,
+        ] {
+            let h = GetDlgItem(app_window(), id);
+            let [x, y, w, height] = control_bounds(id).map(px);
+            SetWindowPos(
+                h,
+                null_mut(),
+                x,
+                y,
+                w,
+                height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            if (FIRST..FIRST + 4).contains(&id) {
+                SendMessageW(h, CB_SETITEMHEIGHT, 0, px(29) as isize);
+                SendMessageW(h, CB_SETITEMHEIGHT, usize::MAX, px(26) as isize);
+            }
+        }
+        RedrawWindow(
+            app_window(),
+            null_mut(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ALLCHILDREN,
+        );
+    }
+}
+pub unsafe fn build() {
+    unsafe {
+        for (id, name) in [
+            (SCOPE, "通用规则"),
+            (BROWSER, "浏览器"),
+            (SAVE, "保存规则"),
+            (TOGGLE, "启用全局手势"),
+            (THEME, "深色"),
+        ] {
+            control(
+                "BUTTON",
+                name,
+                id,
+                WS_TABSTOP | BS_OWNERDRAW as u32,
+                control_bounds(id),
+            );
+        }
+        for id in FIRST..FIRST + 4 {
+            let field = control(
+                "COMBOBOX",
+                "",
+                id,
+                WS_TABSTOP
+                    | WS_VSCROLL
+                    | CBS_DROPDOWNLIST as u32
+                    | CBS_OWNERDRAWFIXED as u32
+                    | CBS_HASSTRINGS as u32,
+                control_bounds(id),
+            );
+            SetWindowSubclass(field, Some(action_field), 1, 0);
+        }
+        control(
+            "GlideQuill.Practice",
+            "试画区域",
+            PAD,
+            0,
+            control_bounds(PAD),
+        );
+        control(
+            "STATIC",
+            "已暂停 · 可在上方试画",
+            RESULT,
+            windows_sys::Win32::System::SystemServices::SS_OWNERDRAW,
+            control_bounds(RESULT),
+        );
+        layout();
+    }
+}
+unsafe fn caption(w: HWND) -> String {
+    let mut buf = [0; 256];
+    let n = unsafe { GetWindowTextW(w, buf.as_mut_ptr(), buf.len() as i32) };
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+// Keep native keyboard, accessibility and dropdown handling.
 unsafe extern "system" fn action_field(
     w: HWND,
     m: u32,
@@ -121,7 +379,7 @@ unsafe extern "system" fn action_field(
     _data: usize,
 ) -> LRESULT {
     unsafe {
-        if m == WM_PAINT || m == WM_PRINTCLIENT || m == WM_PRINT {
+        if matches!(m, WM_PAINT | WM_PRINTCLIENT | WM_PRINT) {
             let mut ps = PAINTSTRUCT::default();
             let dc = if m == WM_PAINT {
                 BeginPaint(w, &mut ps)
@@ -131,32 +389,17 @@ unsafe extern "system" fn action_field(
             let mut r = RECT::default();
             GetClientRect(w, &mut r);
             let p = colors();
+            let focus = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == w;
             fill(dc, r, p.surface);
-            rounded(dc, r, p.base, 5);
-            let mut buf = [0u16; 80];
-            let n = GetWindowTextW(w, buf.as_mut_ptr(), 80);
-            text(
-                dc,
-                &String::from_utf16_lossy(&buf[..n as usize]),
-                rect(12, 0, r.right - 32, r.bottom),
-                15,
-                false,
-                p.text,
-                0,
-            );
-            let cx = r.right - 16;
-            let cy = r.bottom / 2;
-            let pen = CreatePen(PS_SOLID, 2, p.muted);
-            let old = SelectObject(dc, pen);
-            MoveToEx(dc, cx - 4, cy - 2, null_mut());
-            LineTo(dc, cx, cy + 2);
-            LineTo(dc, cx + 5, cy - 3);
-            SelectObject(dc, old);
-            DeleteObject(pen);
-            if windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == w {
-                InflateRect(&mut r, -2, -2);
-                DrawFocusRect(dc, &r);
-            }
+            panel(dc, r, p.surface, if focus { p.accent } else { p.edge }, 5);
+            let chevron = RECT {
+                left: r.right - px(30),
+                ..r
+            };
+            text(dc, "\u{e70d}", chevron, 11, Face::Icon, p.muted, DT_CENTER);
+            r.left += px(12);
+            r.right -= px(32);
+            text(dc, &caption(w), r, 14, Face::Body, p.text, 0);
             if m == WM_PAINT {
                 EndPaint(w, &ps);
             }
@@ -169,127 +412,133 @@ unsafe extern "system" fn action_field(
         ret
     }
 }
-pub unsafe fn build() {
-    unsafe {
-        for (id, name, bounds) in [
-            (SCOPE, "通用规则", [12, 104, 156, 40]),
-            (BROWSER, "浏览器", [12, 150, 156, 40]),
-            (THEME, "深色", [12, HEIGHT - 60, 156, 36]),
-            (SAVE, "保存规则", [RIGHT - 104, 31, 104, 38]),
-            (TOGGLE, "启用全局手势", [RIGHT - 240, 31, 124, 38]),
-        ] {
-            control("BUTTON", name, id, WS_TABSTOP | BS_OWNERDRAW as u32, bounds);
-        }
-        for i in 0..4 {
-            let field = control(
-                "COMBOBOX",
-                "",
-                FIRST + i,
-                WS_TABSTOP
-                    | CBS_DROPDOWNLIST as u32
-                    | CBS_OWNERDRAWFIXED as u32
-                    | CBS_HASSTRINGS as u32,
-                [480, TOP + i * ROW + 9, 275, 300],
-            );
-            SetWindowSubclass(field, Some(action_field), 1, 0);
-        }
-        control(
-            "GlideQuill.Practice",
-            "试画区域",
-            PAD,
-            0,
-            [LEFT, 411, RIGHT - LEFT, 76],
-        );
-        control(
-            "STATIC",
-            "已暂停 · 可在上方试画",
-            RESULT,
-            0,
-            [LEFT, 501, RIGHT - LEFT, 29],
-        );
-    }
-}
 pub unsafe fn paint(w: HWND) {
     unsafe {
         let p = colors();
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(w, &mut ps);
-        fill(dc, rect(0, 0, WIDTH, HEIGHT), p.base);
-        fill(dc, rect(0, 0, SIDEBAR, HEIGHT), p.rail);
-        text(dc, "GlideQuill", rect(22, 16, 170, 60), 25, true, p.text, 0);
-        text(dc, "应用范围", rect(24, 70, 160, 98), 13, false, p.muted, 0);
+        fill(dc, bounds(0, 0, WIDTH, HEIGHT), p.base);
+        fill(dc, bounds(0, 0, RAIL, HEIGHT), p.rail);
+        fill(dc, bounds(RAIL - 1, 0, RAIL, HEIGHT), p.edge);
+        DrawIconEx(
+            dc,
+            px(17),
+            px(23),
+            GetClassLongPtrW(w, GCLP_HICON) as HICON,
+            px(32),
+            px(32),
+            0,
+            null_mut(),
+            DI_NORMAL,
+        );
+        text(
+            dc,
+            "GlideQuill",
+            bounds(56, 20, 166, 57),
+            20,
+            Face::Brand,
+            p.text,
+            0,
+        );
+        text(
+            dc,
+            "规则范围",
+            bounds(22, 67, 150, 97),
+            12,
+            Face::Body,
+            p.muted,
+            0,
+        );
+        fill(
+            dc,
+            bounds(18, HEIGHT - 106, RAIL - 18, HEIGHT - 105),
+            p.edge,
+        );
         let browser = GROUP.with(Cell::get);
         text(
             dc,
-            if browser { "浏览器" } else { "通用手势" },
-            rect(LEFT, 21, 480, 69),
-            30,
-            true,
+            if browser {
+                "浏览器规则"
+            } else {
+                "通用手势"
+            },
+            bounds(LEFT, 18, 525, 57),
+            24,
+            Face::Strong,
             p.text,
             0,
         );
         text(
             dc,
             if browser {
-                "适用于 Chrome、Edge 和 Firefox"
+                "适用于 Chrome、Edge 和 Firefox，可单独指定动作。"
             } else {
-                "适用于普通窗口，浏览器可单独覆盖。"
+                "设置在普通窗口中划动鼠标时执行的动作。"
             },
-            rect(LEFT, 70, RIGHT, 101),
-            15,
-            false,
+            bounds(LEFT, 54, RIGHT - 100, 80),
+            13,
+            Face::Body,
             p.muted,
             0,
         );
+        panel(
+            dc,
+            bounds(LEFT, 96, RIGHT, TOP + ROW * 4),
+            p.surface,
+            p.edge,
+            9,
+        );
         text(
             dc,
-            "手势",
-            rect(LEFT + 16, 116, 400, 148),
-            13,
-            true,
+            "手势方向",
+            bounds(LEFT + 18, 96, FIELD, TOP),
+            12,
+            Face::Body,
             p.muted,
             0,
         );
         text(
             dc,
             "执行动作",
-            rect(484, 116, 740, 148),
-            13,
-            true,
+            bounds(FIELD, 96, RIGHT, TOP),
+            12,
+            Face::Body,
             p.muted,
             0,
         );
         for (i, (arrow, name)) in [
-            ("←", "向左划"),
-            ("→", "向右划"),
-            ("↑", "向上划"),
-            ("↓", "向下划"),
+            ("\u{e72b}", "向左划"),
+            ("\u{e72a}", "向右划"),
+            ("\u{e74a}", "向上划"),
+            ("\u{e74b}", "向下划"),
         ]
         .iter()
         .enumerate()
         {
             let y = TOP + i as i32 * ROW;
-            rounded(dc, rect(LEFT, y, RIGHT, y + ROW - 4), p.surface, 8);
-            text(
-                dc,
-                arrow,
-                rect(LEFT + 18, y, LEFT + 50, y + 44),
-                21,
-                true,
-                p.accent,
-                0,
-            );
+            fill(dc, bounds(LEFT + 1, y, RIGHT - 1, y + 1), p.edge);
+            let badge = bounds(LEFT + 18, y + 12, LEFT + 48, y + 42);
+            rounded(dc, badge, p.selected, 8);
+            text(dc, arrow, badge, 15, Face::Icon, p.accent, DT_CENTER);
             text(
                 dc,
                 name,
-                rect(LEFT + 68, y, 440, y + 44),
-                16,
-                true,
+                bounds(LEFT + 61, y, FIELD - 12, y + ROW),
+                15,
+                Face::Body,
                 p.text,
                 0,
             );
         }
-        text(dc, "试画", rect(LEFT, 363, 300, 402), 19, true, p.text, 0);
+        text(
+            dc,
+            "手势试画",
+            bounds(LEFT, 360, RIGHT, 397),
+            17,
+            Face::Strong,
+            p.text,
+            0,
+        );
         EndPaint(w, &ps);
     }
 }
@@ -313,71 +562,175 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                     p.surface
                 },
             );
-            r.left += 8;
-            text(dc, name, r, 15, false, p.text, 0);
+            r.left += px(10);
+            text(dc, name, r, 14, Face::Body, p.text, 0);
+        } else if id == RESULT {
+            fill(dc, r, p.base);
+            text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);
         } else {
             let nav = id == SCOPE || id == BROWSER;
-            let active = nav && (id == BROWSER) == GROUP.with(Cell::get);
-            let rail = nav || id == THEME;
-            fill(dc, r, if rail { p.rail } else { p.base });
-            let bg = if id == SAVE {
-                p.accent
-            } else if active {
-                p.selected
-            } else if rail {
-                p.rail
+            let selected = nav && (id == BROWSER) == GROUP.with(Cell::get);
+            let pressed = item.itemState & ODS_SELECTED != 0;
+            let mut label = caption(item.hwndItem);
+            fill(dc, r, if id == SAVE { p.base } else { p.rail });
+            if id == SAVE {
+                let disabled = item.itemState & ODS_DISABLED != 0;
+                rounded(
+                    dc,
+                    r,
+                    if disabled {
+                        p.edge
+                    } else if pressed {
+                        p.text
+                    } else {
+                        p.accent
+                    },
+                    6,
+                );
+                text(
+                    dc,
+                    &label,
+                    r,
+                    14,
+                    Face::Strong,
+                    if disabled { p.muted } else { p.ink },
+                    DT_CENTER,
+                );
+            } else if id == TOGGLE {
+                let on = LISTENER.with(|v| v.borrow().is_some());
+                let track = bounds(101, 11, 132, 27);
+                rounded(dc, track, if on { p.accent } else { p.muted }, 8);
+                rounded(
+                    dc,
+                    if on {
+                        bounds(118, 13, 130, 25)
+                    } else {
+                        bounds(103, 13, 115, 25)
+                    },
+                    p.surface,
+                    6,
+                );
+                text(
+                    dc,
+                    "全局手势",
+                    bounds(10, 0, 96, 36),
+                    14,
+                    Face::Body,
+                    p.text,
+                    0,
+                );
             } else {
-                p.edge
-            };
-            rounded(dc, r, bg, 7);
-            let mut buf = [0; 100];
-            let n = GetWindowTextW(item.hwndItem, buf.as_mut_ptr(), 100);
-            let mut name = String::from_utf16_lossy(&buf[..n as usize]);
-            if id == THEME {
-                name = format!("切换至{name}外观");
+                if selected || pressed {
+                    rounded(dc, r, p.selected, 6);
+                }
+                let icon = match id {
+                    SCOPE => "\u{e7f4}",
+                    BROWSER => "\u{e774}",
+                    _ if DARK.with(Cell::get) => "\u{e706}",
+                    _ => "\u{e708}",
+                };
+                if id == THEME {
+                    label.push_str("外观");
+                }
+                let c = if selected { p.accent } else { p.text };
+                text(
+                    dc,
+                    icon,
+                    bounds(10, 0, 34, 36),
+                    16,
+                    Face::Icon,
+                    c,
+                    DT_CENTER,
+                );
+                r.left += px(44);
+                text(
+                    dc,
+                    &label,
+                    r,
+                    14,
+                    if selected { Face::Strong } else { Face::Body },
+                    c,
+                    0,
+                );
             }
-            if rail {
-                r.left += 14
-            }
-            text(
-                dc,
-                &name,
-                r,
-                15,
-                active || id == SAVE,
-                if id == SAVE {
-                    p.base
-                } else if active {
-                    p.accent
-                } else {
-                    p.text
-                },
-                if rail { 0 } else { DT_CENTER },
-            );
         }
         if item.itemState & ODS_FOCUS != 0 {
-            let mut f = item.rcItem;
-            InflateRect(&mut f, -3, -3);
-            DrawFocusRect(dc, &f);
+            DrawFocusRect(dc, &inset(item.rcItem, px(3)));
         }
     }
 }
-pub unsafe fn static_style(dc: HDC) -> LRESULT {
-    unsafe {
-        let p = colors();
-        SetTextColor(dc, p.muted);
-        SetBkColor(dc, p.base);
-        SetDCBrushColor(dc, p.base);
-        GetStockObject(DC_BRUSH) as isize
-    }
-}
-pub unsafe fn pad_background(dc: HDC, r: RECT, empty: bool) {
+pub unsafe fn paint_pad(dc: HDC, r: RECT, trail: &[POINT]) {
     unsafe {
         let p = colors();
         fill(dc, r, p.base);
-        rounded(dc, r, p.selected, 9);
-        if empty {
-            text(dc, "按住右键，在此试画", r, 16, false, p.accent, DT_CENTER);
+        panel(dc, r, p.surface, p.edge, 8);
+        // Tile the practice grid in one blit even during continuous pointer movement.
+        let step = px(12);
+        let tile_dc = CreateCompatibleDC(dc);
+        let tile = CreateCompatibleBitmap(dc, step, step);
+        if !tile_dc.is_null() && !tile.is_null() {
+            let old = SelectObject(tile_dc, tile);
+            fill(tile_dc, bounds(0, 0, 12, 12), p.surface);
+            SetPixelV(tile_dc, step / 2, step / 2, p.grid);
+            SelectObject(tile_dc, old);
+            let pattern = CreatePatternBrush(tile);
+            if !pattern.is_null() {
+                FillRect(dc, &inset(r, px(6)), pattern);
+                DeleteObject(pattern);
+            }
+        }
+        if !tile.is_null() {
+            DeleteObject(tile);
+        }
+        if !tile_dc.is_null() {
+            DeleteDC(tile_dc);
+        }
+        if trail.len() >= 2 {
+            let pixels: Vec<_> = trail
+                .iter()
+                .map(|pt| Point {
+                    X: px(pt.x),
+                    Y: px(pt.y),
+                })
+                .collect();
+            let mut graphics = null_mut();
+            let mut pen = null_mut();
+            if GdipCreateFromHDC(dc, &mut graphics) == Ok
+                && GdipCreatePen1(
+                    0xff000000 | rgb(p.accent),
+                    px(2) as f32,
+                    UnitPixel,
+                    &mut pen,
+                ) == Ok
+            {
+                GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+                GdipDrawLinesI(graphics, pen, pixels.as_ptr(), pixels.len() as i32);
+            }
+            if !pen.is_null() {
+                GdipDeletePen(pen);
+            }
+            if !graphics.is_null() {
+                GdipDeleteGraphics(graphics);
+            }
+        } else {
+            let cy = r.bottom / 2;
+            let cx = r.right / 2;
+            let label = RECT {
+                left: cx - px(85),
+                top: cy - px(15),
+                right: cx + px(85),
+                bottom: cy + px(15),
+            };
+            rounded(dc, label, p.surface, 8);
+            text(
+                dc,
+                "按住鼠标右键，划一条直线",
+                label,
+                13,
+                Face::Body,
+                p.muted,
+                DT_CENTER,
+            );
         }
     }
 }
