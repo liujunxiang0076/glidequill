@@ -132,11 +132,11 @@ impl Action {
             Self::Forward => "前进",
             Self::Home => "页面顶部",
             Self::End => "页面底部",
-            Self::Copy => "复制",
-            Self::Paste => "粘贴",
-            Self::Minimize => "最小化窗口",
-            Self::Maximize => "最大化／还原",
-            Self::Close => "关闭窗口",
+            Self::Copy => "复制 · 仅预览",
+            Self::Paste => "粘贴 · 仅预览",
+            Self::Minimize => "最小化窗口 · 仅预览",
+            Self::Maximize => "最大化／还原 · 仅预览",
+            Self::Close => "关闭窗口 · 仅预览",
         }
     }
 }

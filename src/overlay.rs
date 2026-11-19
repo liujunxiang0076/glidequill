@@ -110,18 +110,19 @@ pub fn extend(window: HWND, pt: POINT, action: Option<Action>) {
         notify(window);
     }
 }
-pub fn finish(window: HWND, pt: POINT, action: Option<Action>) {
+pub fn finish(window: HWND, pt: POINT, action: Option<Action>) -> Option<Action> {
     let mut state = TRAIL.lock().unwrap();
     if state.target == 0 {
-        return;
+        return None;
     }
     let now = Instant::now();
     let result_ms = settings::preferences().result_ms;
-    if result_ms == 0 || state.idle_deadline.is_some_and(|t| now >= t) {
+    let expired = state.idle_deadline.is_some_and(|t| now >= t);
+    if result_ms == 0 || expired {
         *state = Trail::default();
         drop(state);
         notify(window);
-        return;
+        return if expired { None } else { action };
     }
     state.idle_deadline = None;
     append(&mut state.points, pt);
@@ -131,6 +132,7 @@ pub fn finish(window: HWND, pt: POINT, action: Option<Action>) {
     state.expires = Some(now + Duration::from_millis(result_ms.into()));
     drop(state);
     notify(window);
+    action
 }
 pub fn cancel(window: HWND) {
     let mut state = TRAIL.lock().unwrap();

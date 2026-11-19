@@ -8,6 +8,7 @@ use std::{
 use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, SetEvent, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
 use windows_sys::Win32::{
     Foundation::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
 };
@@ -43,9 +44,25 @@ impl Listener {
                         let _ = ready.send(Err(io::Error::last_os_error()));
                         return;
                     }
+                    let focus = SetWinEventHook(
+                        EVENT_SYSTEM_FOREGROUND,
+                        EVENT_SYSTEM_FOREGROUND,
+                        null_mut(),
+                        Some(input::foreground_changed),
+                        0,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    );
+                    if focus.is_null() {
+                        let error = io::Error::last_os_error();
+                        UnhookWindowsHookEx(hook);
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
                     if ready.send(Ok(())).is_ok() {
                         pump(worker_stop.as_raw_handle());
                     }
+                    UnhookWinEvent(focus);
                     UnhookWindowsHookEx(hook);
                 })?;
             let session = Self {

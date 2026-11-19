@@ -1,5 +1,10 @@
 use crate::{overlay, settings};
-use glidequill::Stroke;
+use glidequill::{Action, Stroke};
+use windows_sys::Win32::System::{
+    SystemInformation::GetTickCount,
+    SystemServices::{APPCOMMAND_BROWSER_BACKWARD, APPCOMMAND_BROWSER_FORWARD},
+};
+use windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK;
 
 use std::{
     cell::{Cell, RefCell},
@@ -11,6 +16,8 @@ use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::Keyb
 
 struct Capture {
     target: HWND,
+    started: u32,
+    cancelled: bool,
     bindings: [glidequill::Action; glidequill::GESTURES.len()],
     origin: POINT,
     dpi: u32,
@@ -94,6 +101,88 @@ unsafe fn is_elevated(proc: HANDLE) -> bool {
         ok == 0 || elevation.TokenIsElevated != 0
     }
 }
+// A switch away cancels this stroke even if the original window regains focus before release.
+pub unsafe extern "system" fn foreground_changed(
+    _: HWINEVENTHOOK,
+    _: u32,
+    hwnd: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    event_time: u32,
+) {
+    CAPTURE.with_borrow_mut(|capture| {
+        if let Some(s) = capture
+            && !s.cancelled
+            && hwnd != s.target
+            && event_time.wrapping_sub(s.started) as i32 >= 0
+        {
+            s.cancelled = true;
+            overlay::cancel(SETTINGS_WINDOW.get());
+        }
+    });
+}
+
+fn modifiers_pressed() -> bool {
+    [
+        VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_LBUTTON, VK_MBUTTON,
+    ]
+    .iter()
+    .any(|&key| unsafe { GetAsyncKeyState(key as i32) < 0 })
+}
+
+// Address the original HWND directly. A slow application must never block the input hook.
+unsafe fn navigate(target: HWND, action: Action) {
+    unsafe {
+        if target != GetForegroundWindow() || modifiers_pressed() {
+            return;
+        }
+        match action {
+            Action::Back | Action::Forward => {
+                let command = if action == Action::Back {
+                    APPCOMMAND_BROWSER_BACKWARD
+                } else {
+                    APPCOMMAND_BROWSER_FORWARD
+                };
+                PostMessageW(
+                    target,
+                    WM_APPCOMMAND,
+                    target as usize,
+                    ((FAPPCOMMAND_MOUSE | command) << 16) as isize,
+                );
+            }
+            Action::Home | Action::End => {
+                let mut gui = GUITHREADINFO {
+                    cbSize: size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetGUIThreadInfo(0, &mut gui) == 0
+                    || gui.hwndActive != target
+                    || gui.hwndFocus.is_null()
+                    || GetAncestor(gui.hwndFocus, GA_ROOT) != target
+                {
+                    return;
+                }
+                let key = if action == Action::Home {
+                    VK_HOME
+                } else {
+                    VK_END
+                };
+                let scan = MapVirtualKeyW(key.into(), MAPVK_VK_TO_VSC);
+                let flags = 1 | ((scan & 0xff) << 16) | (1 << 24);
+                if PostMessageW(gui.hwndFocus, WM_KEYDOWN, key as usize, flags as isize) != 0 {
+                    PostMessageW(
+                        gui.hwndFocus,
+                        WM_KEYUP,
+                        key as usize,
+                        (flags | (3 << 30)) as i32 as isize,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
 pub unsafe extern "system" fn hook(code: i32, msg: WPARAM, data: LPARAM) -> LRESULT {
     unsafe {
         if code < 0 || PASS_THROUGH.with(Cell::get) {
@@ -114,13 +203,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
     unsafe {
         match msg {
             WM_RBUTTONDOWN => {
-                if [
-                    VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_LBUTTON, VK_MBUTTON,
-                ]
-                .iter()
-                .any(|&k| GetAsyncKeyState(k as i32) < 0)
-                    || GetSystemMetrics(SM_SWAPBUTTON) != 0
-                {
+                if modifiers_pressed() || GetSystemMetrics(SM_SWAPBUTTON) != 0 {
                     false
                 } else if let Some(target) = eligible(point) {
                     let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(target).max(96);
@@ -128,6 +211,8 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                     CAPTURE.with(|c| {
                         *c.borrow_mut() = Some(Capture {
                             target,
+                            started: GetTickCount(),
+                            cancelled: false,
                             bindings: settings::preferences().bindings,
                             origin: point,
                             dpi,
@@ -142,8 +227,12 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
             WM_MOUSEMOVE => {
                 CAPTURE.with(|c| {
                     if let Some(s) = c.borrow_mut().as_mut() {
+                        if s.cancelled {
+                            return;
+                        }
                         s.sample(point);
-                        if s.target != GetForegroundWindow() {
+                        if s.target != GetForegroundWindow() || modifiers_pressed() {
+                            s.cancelled = true;
                             overlay::cancel(SETTINGS_WINDOW.with(Cell::get));
                         } else if !s.stroke.is_click() {
                             overlay::extend(
@@ -160,7 +249,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                 if let Some(mut s) = CAPTURE.with(|c| c.borrow_mut().take()) {
                     s.sample(point);
                     let window = SETTINGS_WINDOW.with(Cell::get);
-                    if s.target != GetForegroundWindow() {
+                    if s.cancelled || s.target != GetForegroundWindow() || modifiers_pressed() {
                         overlay::cancel(window);
                     } else if s.stroke.is_click() {
                         overlay::cancel(window);
@@ -168,11 +257,10 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             replay_click();
                         }
                     } else {
-                        overlay::finish(
-                            window,
-                            point,
-                            s.stroke.gesture().map(|d| s.bindings[d as usize]),
-                        );
+                        let action = s.stroke.gesture().map(|d| s.bindings[d as usize]);
+                        if let Some(action) = overlay::finish(window, point, action) {
+                            navigate(s.target, action);
+                        }
                     }
                     true
                 } else {
@@ -201,6 +289,16 @@ unsafe fn replay_click() {
 mod tests {
     use super::*;
     use crate::{ui, wide};
+    fn received(window: HWND, message: u32) -> Vec<MSG> {
+        let mut messages = Vec::new();
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, window, message, message, PM_REMOVE) != 0 {
+                messages.push(msg);
+            }
+        }
+        messages
+    }
     // Runs on an interactive desktop. Feed physical-coordinate samples through the
     // production gesture handler without moving the user's pointer or injecting clicks.
     #[test]
@@ -261,19 +359,36 @@ mod tests {
                 None,
                 "saved exclusion must bypass the next stroke"
             );
+            assert!(!gesture(WM_RBUTTONDOWN, start));
+            assert!(!gesture(WM_RBUTTONUP, start));
             settings::save_exclusions_in(&test_dir, &[]).unwrap();
             assert_eq!(eligible(start), Some(hwnd));
             std::fs::remove_file(test_dir.join("excluded.json")).unwrap();
             std::fs::remove_file(test_dir.join("settings.json")).unwrap();
             std::fs::remove_dir(test_dir).unwrap();
+            // Exercise the ordinary-click replay inside the disposable test window.
+            let mut original_pointer = POINT::default();
+            assert_ne!(GetCursorPos(&mut original_pointer), 0);
+            assert_ne!(SetCursorPos(start.x, start.y), 0);
+            let click_consumed = gesture(WM_RBUTTONDOWN, start) && gesture(WM_RBUTTONUP, start);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let (mut down, mut up) = (0, 0);
+            while std::time::Instant::now() < until && up == 0 {
+                down += received(hwnd, WM_RBUTTONDOWN).len();
+                up += received(hwnd, WM_RBUTTONUP).len();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            SetCursorPos(original_pointer.x, original_pointer.y);
+            assert!(click_consumed);
+            assert_eq!((down, up), (1, 1));
             for (x, y, expected) in [
                 (180, 240, "后退"),
                 (380, 240, "前进"),
                 (280, 140, "页面顶部"),
                 (280, 340, "页面底部"),
-                (190, 150, "复制"),
-                (370, 150, "粘贴"),
-                (190, 330, "最小化窗口"),
+                (190, 150, "复制 · 仅预览"),
+                (370, 150, "粘贴 · 仅预览"),
+                (190, 330, "最小化窗口 · 仅预览"),
                 (370, 330, ""),
             ] {
                 let end = POINT { x, y };
@@ -317,7 +432,40 @@ mod tests {
                 }
                 assert_eq!(GetForegroundWindow(), hwnd);
                 assert_eq!(GetAncestor(WindowFromPoint(end), GA_ROOT), hwnd);
+                assert!(received(hwnd, WM_APPCOMMAND).is_empty());
+                assert!(received(hwnd, WM_KEYDOWN).is_empty());
                 assert!(gesture(WM_RBUTTONUP, end));
+                assert!(!gesture(WM_RBUTTONUP, end));
+                let commands = received(hwnd, WM_APPCOMMAND);
+                let downs = received(hwnd, WM_KEYDOWN);
+                let ups = received(hwnd, WM_KEYUP);
+                match expected {
+                    "后退" | "前进" => {
+                        let command = if expected == "后退" {
+                            APPCOMMAND_BROWSER_BACKWARD
+                        } else {
+                            APPCOMMAND_BROWSER_FORWARD
+                        };
+                        assert_eq!(commands.len(), 1);
+                        assert_eq!(
+                            (commands[0].lParam as u32) >> 16,
+                            FAPPCOMMAND_MOUSE | command
+                        );
+                        assert!(downs.is_empty() && ups.is_empty());
+                    }
+                    "页面顶部" | "页面底部" => {
+                        let key = if expected == "页面顶部" {
+                            VK_HOME
+                        } else {
+                            VK_END
+                        };
+                        assert!(commands.is_empty());
+                        assert_eq!((downs.len(), ups.len()), (1, 1));
+                        assert_eq!(downs[0].wParam, key as usize);
+                        assert_eq!(ups[0].wParam, key as usize);
+                    }
+                    _ => assert!(commands.is_empty() && downs.is_empty() && ups.is_empty()),
+                }
                 overlay::refresh(hwnd);
                 let mut rect = RECT::default();
                 GetWindowRect(popup, &mut rect);
@@ -356,7 +504,7 @@ mod tests {
                         (345, 131),
                         (370, 128),
                     ],
-                    "复制",
+                    "复制 · 仅预览",
                 ),
             ] {
                 assert!(gesture(WM_RBUTTONDOWN, start));
@@ -400,6 +548,25 @@ mod tests {
             ReleaseDC(null_mut(), screen);
             assert!(blended, "antialiased curve edge");
             assert!(gesture(WM_RBUTTONUP, POINT { x: 382, y: 245 }));
+            received(hwnd, WM_APPCOMMAND);
+            // Even after returning to the starting window, a cancelled capture stays cancelled.
+            assert!(gesture(WM_RBUTTONDOWN, start));
+            foreground_changed(
+                null_mut(),
+                EVENT_SYSTEM_FOREGROUND,
+                GetDesktopWindow(),
+                0,
+                0,
+                0,
+                GetTickCount(),
+            );
+            let across = POINT {
+                x: start.x + 100,
+                y: start.y,
+            };
+            gesture(WM_MOUSEMOVE, across);
+            assert!(gesture(WM_RBUTTONUP, across));
+            assert!(received(hwnd, WM_APPCOMMAND).is_empty());
             // The held stroke expires independently of mouse-up, and cannot revive.
             let end = POINT { x: 380, y: 240 };
             assert!(gesture(WM_RBUTTONDOWN, start));
@@ -412,6 +579,8 @@ mod tests {
             assert!(gesture(WM_RBUTTONUP, end));
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
+
+            assert!(received(hwnd, WM_APPCOMMAND).is_empty());
 
             // With idle cancellation disabled the same pause keeps the trail. Zero
             // release time must hide it on the first frame after release.
@@ -431,6 +600,7 @@ mod tests {
             assert!(gesture(WM_RBUTTONUP, end));
             overlay::refresh(hwnd);
             assert_eq!(IsWindowVisible(popup), 0);
+            assert_eq!(received(hwnd, WM_APPCOMMAND).len(), 1);
             let mut monitor = MONITORINFO {
                 cbSize: size_of::<MONITORINFO>() as u32,
                 ..Default::default()
