@@ -10,7 +10,9 @@ const LEFT: i32 = RAIL + 24;
 const RIGHT: i32 = WIDTH - 24;
 const CARD_TOP: i32 = 94;
 const SETTING_HEIGHT: i32 = 68;
-const FIELD: i32 = LEFT + 260;
+const COLUMN: i32 = (RIGHT - LEFT - 2) / 2;
+pub const PICKER: i32 = 160;
+const COUNT: i32 = DIRECTIONS.len() as i32;
 const ROW_START: i32 = CARD_TOP + 34;
 const ROW_HEIGHT: i32 = 46;
 pub const RULE_ROW: i32 = 140;
@@ -147,17 +149,17 @@ unsafe fn panel(dc: HDC, r: RECT, background: u32, edge: u32, radius: i32) {
 enum Face {
     Body,
     Strong,
-    Brand,
+    Arrow,
     Icon,
 }
 unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u32, align: u32) {
     unsafe {
         let family = match face {
             Face::Icon => "Segoe MDL2 Assets",
-            Face::Brand => "Segoe UI",
+            Face::Arrow => "Segoe UI Symbol",
             _ => "Microsoft YaHei UI",
         };
-        let weight = if matches!(face, Face::Strong | Face::Brand) {
+        let weight = if matches!(face, Face::Strong) {
             600
         } else {
             400
@@ -245,9 +247,9 @@ unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u
 }
 fn control_bounds(id: i32) -> [i32; 4] {
     match id {
-        id if id == Page::General as i32 => [10, 75, RAIL - 20, 38],
-        id if id == Page::Rules as i32 => [10, 118, RAIL - 20, 38],
-        id if id == Page::Feedback as i32 => [10, 161, RAIL - 20, 38],
+        id if id == Page::General as i32 => [10, 16, RAIL - 20, 38],
+        id if id == Page::Rules as i32 => [10, 59, RAIL - 20, 38],
+        id if id == Page::Feedback as i32 => [10, 102, RAIL - 20, 38],
         TOGGLE if PAGE.with(Cell::get) == Page::General => [RIGHT - 125, CARD_TOP + 17, 113, 34],
         TOGGLE => [RIGHT - 113, 20, 113, 34],
         AUTOSTART => [RIGHT - 125, CARD_TOP + SETTING_HEIGHT + 17, 113, 34],
@@ -255,19 +257,25 @@ fn control_bounds(id: i32) -> [i32; 4] {
         IDLE => [RIGHT - 145, CARD_TOP + 17, 132, 34],
         LINGER => [RIGHT - 145, CARD_TOP + SETTING_HEIGHT + 17, 132, 34],
         RESULT => [LEFT, HEIGHT - 35, RIGHT - LEFT, 26],
-        _ => [
-            LEFT + 1,
-            ROW_START + (id - RULE_ROW) * ROW_HEIGHT,
-            RIGHT - LEFT - 2,
-            ROW_HEIGHT,
-        ],
+        _ => {
+            let picker = id >= PICKER;
+            let index = id - if picker { PICKER } else { RULE_ROW };
+            let x = LEFT + 1 + index / 4 * COLUMN;
+            let y = ROW_START + index % 4 * ROW_HEIGHT;
+            if picker {
+                [x + 96, y + 8, COLUMN - 109, 330]
+            } else {
+                [x + 1, y + 1, 94, ROW_HEIGHT - 2]
+            }
+        }
     }
 }
 fn controls() -> impl Iterator<Item = i32> {
     [THEME, TOGGLE, AUTOSTART, IDLE, LINGER, RESULT]
         .into_iter()
         .chain(Page::ALL.map(|p| p as i32))
-        .chain(RULE_ROW..RULE_ROW + 4)
+        .chain(RULE_ROW..RULE_ROW + COUNT)
+        .chain(PICKER..PICKER + COUNT)
 }
 pub unsafe fn layout() {
     unsafe {
@@ -277,7 +285,11 @@ pub unsafe fn layout() {
                 THEME | AUTOSTART => page == Page::General,
                 IDLE | LINGER => page == Page::Feedback,
                 TOGGLE => page != Page::Feedback,
-                RULE_ROW..=143 => page == Page::Rules,
+                id if (RULE_ROW..RULE_ROW + COUNT).contains(&id)
+                    || (PICKER..PICKER + COUNT).contains(&id) =>
+                {
+                    page == Page::Rules
+                }
                 _ => true,
             };
             let [x, y, w, h] = control_bounds(id).map(px);
@@ -296,6 +308,11 @@ pub unsafe fn layout() {
                         SWP_HIDEWINDOW
                     },
             );
+            if (PICKER..PICKER + COUNT).contains(&id) {
+                let field = GetDlgItem(app_window(), id);
+                SendMessageW(field, CB_SETITEMHEIGHT, 0, px(28) as isize);
+                SendMessageW(field, CB_SETITEMHEIGHT, usize::MAX, px(26) as isize);
+            }
         }
         RedrawWindow(
             app_window(),
@@ -334,15 +351,35 @@ pub unsafe fn build() {
             control_bounds(RESULT),
         );
         for (index, dir) in DIRECTIONS.iter().enumerate() {
-            let (name, action) = dir.labels();
             let id = RULE_ROW + index as i32;
-            control(
-                "STATIC",
-                &format!("{name} · {action}"),
+            control("STATIC", dir.name(), id, static_style, control_bounds(id));
+            let id = PICKER + index as i32;
+            let field = control(
+                "COMBOBOX",
+                "",
                 id,
-                static_style,
+                WS_TABSTOP
+                    | WS_VSCROLL
+                    | CBS_DROPDOWNLIST as u32
+                    | CBS_OWNERDRAWFIXED as u32
+                    | CBS_HASSTRINGS as u32,
                 control_bounds(id),
             );
+            for action in ACTIONS {
+                SendMessageW(
+                    field,
+                    CB_ADDSTRING,
+                    0,
+                    wide(action.label()).as_ptr() as isize,
+                );
+            }
+            SendMessageW(
+                field,
+                CB_SETCURSEL,
+                settings::preferences().bindings[index] as usize,
+                0,
+            );
+            SetWindowSubclass(field, Some(action_field), 1, 0);
         }
     }
 }
@@ -350,6 +387,49 @@ unsafe fn caption(w: HWND) -> String {
     let mut buf = [0; 256];
     let n = unsafe { GetWindowTextW(w, buf.as_mut_ptr(), buf.len() as i32) };
     String::from_utf16_lossy(&buf[..n as usize])
+}
+// Keep native keyboard, accessibility and dropdown handling.
+unsafe extern "system" fn action_field(
+    w: HWND,
+    m: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        if matches!(m, WM_PAINT | WM_PRINTCLIENT | WM_PRINT) {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = if m == WM_PAINT {
+                BeginPaint(w, &mut ps)
+            } else {
+                wp as HDC
+            };
+            let mut r = RECT::default();
+            GetClientRect(w, &mut r);
+            let p = colors();
+            let focus = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == w;
+            fill(dc, r, p.surface);
+            panel(dc, r, p.surface, if focus { p.accent } else { p.edge }, 5);
+            let chevron = RECT {
+                left: r.right - px(30),
+                ..r
+            };
+            text(dc, "\u{e70d}", chevron, 11, Face::Icon, p.muted, DT_CENTER);
+            r.left += px(12);
+            r.right -= px(32);
+            text(dc, &caption(w), r, 14, Face::Body, p.text, 0);
+            if m == WM_PAINT {
+                EndPaint(w, &ps);
+            }
+            return 0;
+        }
+        let ret = DefSubclassProc(w, m, wp, lp);
+        if matches!(m, WM_SETFOCUS | WM_KILLFOCUS | CB_SETCURSEL | WM_ENABLE) {
+            InvalidateRect(w, null_mut(), 0);
+        }
+        ret
+    }
 }
 pub unsafe fn paint(w: HWND) {
     unsafe {
@@ -359,26 +439,6 @@ pub unsafe fn paint(w: HWND) {
         fill(dc, bounds(0, 0, WIDTH, HEIGHT), p.base);
         fill(dc, bounds(0, 0, RAIL, HEIGHT), p.rail);
         fill(dc, bounds(RAIL - 1, 0, RAIL, HEIGHT), p.edge);
-        DrawIconEx(
-            dc,
-            px(17),
-            px(20),
-            GetClassLongPtrW(w, GCLP_HICON) as HICON,
-            px(28),
-            px(28),
-            0,
-            null_mut(),
-            DI_NORMAL,
-        );
-        text(
-            dc,
-            "GlideQuill",
-            bounds(50, 14, RAIL - 3, 54),
-            19,
-            Face::Brand,
-            p.text,
-            0,
-        );
         let page = PAGE.with(Cell::get);
         text(
             dc,
@@ -390,7 +450,7 @@ pub unsafe fn paint(w: HWND) {
             0,
         );
         let description = match page {
-            Page::Rules => "按住右键划动，匹配的动作将在屏幕下方显示。",
+            Page::Rules => "选择动作后即时保存，划动时可在屏幕下方预览。",
             Page::General => "管理手势启停、登录启动与窗口外观。",
             Page::Feedback => "调整停笔和松键后，轨迹与动作字幕的显示时间。",
         };
@@ -413,21 +473,35 @@ pub unsafe fn paint(w: HWND) {
             );
             text(
                 dc,
-                "划动方向",
-                bounds(LEFT + 17, CARD_TOP, FIELD, ROW_START),
-                12,
-                Face::Body,
-                p.muted,
+                "基础方向",
+                bounds(LEFT + 15, CARD_TOP, RIGHT - 135, ROW_START),
+                14,
+                Face::Strong,
+                p.text,
                 0,
             );
             text(
                 dc,
-                "对应动作（仅预览）",
-                bounds(FIELD, CARD_TOP, RIGHT, ROW_START),
+                "对应动作 · 仅预览",
+                bounds(RIGHT - 145, CARD_TOP, RIGHT - 13, ROW_START),
                 12,
                 Face::Body,
                 p.muted,
-                0,
+                DT_RIGHT,
+            );
+            for row in 0..4 {
+                let y = ROW_START + row * ROW_HEIGHT;
+                fill(dc, bounds(LEFT + 1, y, RIGHT - 1, y + 1), p.edge);
+            }
+            fill(
+                dc,
+                bounds(
+                    LEFT + 1 + COLUMN,
+                    ROW_START + 1,
+                    LEFT + 2 + COLUMN,
+                    ROW_START + 4 * ROW_HEIGHT,
+                ),
+                p.edge,
             );
         } else {
             let rows: &[(&str, &str)] = match page {
@@ -488,47 +562,38 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         let id = item.CtlID as i32;
         let dc = item.hDC;
         let r = item.rcItem;
-        if (RULE_ROW..RULE_ROW + 4).contains(&id) {
-            let index = (id - RULE_ROW) as usize;
-            let (name, action) = DIRECTIONS[index].labels();
+        if (RULE_ROW..RULE_ROW + COUNT).contains(&id) {
+            let dir = DIRECTIONS[(id - RULE_ROW) as usize];
             fill(dc, r, p.surface);
-            fill(
-                dc,
-                RECT {
-                    bottom: r.top + 1,
-                    ..r
-                },
-                p.edge,
-            );
-            let badge = bounds(16, 9, 44, 37);
-            rounded(dc, badge, p.selected, 7);
+            let tile = bounds(9, 8, 36, 35);
+            rounded(dc, tile, p.selected, 7);
+            text(dc, dir.arrow(), tile, 17, Face::Arrow, p.accent, DT_CENTER);
             text(
                 dc,
-                ["\u{e72b}", "\u{e72a}", "\u{e74a}", "\u{e74b}"][index],
-                badge,
-                14,
-                Face::Icon,
-                p.accent,
-                DT_CENTER,
-            );
-            text(
-                dc,
-                name,
-                bounds(55, 0, 258, ROW_HEIGHT),
+                dir.name(),
+                bounds(42, 0, 94, 44),
                 14,
                 Face::Body,
                 p.text,
                 0,
             );
-            text(
-                dc,
-                action,
-                bounds(FIELD - LEFT - 1, 0, RIGHT - LEFT - 10, ROW_HEIGHT),
-                14,
-                Face::Body,
-                p.text,
-                0,
-            );
+        } else if (PICKER..PICKER + COUNT).contains(&id) {
+            let selected = item.itemState & ODS_SELECTED != 0;
+            fill(dc, r, if selected { p.selected } else { p.surface });
+            if let Some(a) = ACTIONS.get(item.itemID as usize) {
+                text(
+                    dc,
+                    a.label(),
+                    RECT {
+                        left: r.left + px(9),
+                        ..r
+                    },
+                    14,
+                    Face::Body,
+                    p.text,
+                    0,
+                );
+            }
         } else if id == RESULT {
             fill(dc, r, p.base);
             text(dc, &caption(item.hwndItem), r, 12, Face::Body, p.muted, 0);

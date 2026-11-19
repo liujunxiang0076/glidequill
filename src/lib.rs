@@ -1,25 +1,105 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 pub enum Direction {
     Left,
     Right,
     Up,
     Down,
+    UpLeft,
+    UpRight,
+    DownLeft,
+    DownRight,
 }
-
-pub const DIRECTIONS: [Direction; 4] = [
+pub const DIRECTIONS: [Direction; 8] = [
     Direction::Left,
     Direction::Right,
     Direction::Up,
     Direction::Down,
+    Direction::UpLeft,
+    Direction::UpRight,
+    Direction::DownLeft,
+    Direction::DownRight,
 ];
 
 impl Direction {
-    pub const fn labels(self) -> (&'static str, &'static str) {
+    pub const fn name(self) -> &'static str {
         match self {
-            Self::Left => ("向左划", "后退"),
-            Self::Right => ("向右划", "前进"),
-            Self::Up => ("向上划", "页面顶部"),
-            Self::Down => ("向下划", "页面底部"),
+            Self::Left => "向左",
+            Self::Right => "向右",
+            Self::Up => "向上",
+            Self::Down => "向下",
+            Self::UpLeft => "左上",
+            Self::UpRight => "右上",
+            Self::DownLeft => "左下",
+            Self::DownRight => "右下",
+        }
+    }
+    pub const fn arrow(self) -> &'static str {
+        match self {
+            Self::Left => "←",
+            Self::Right => "→",
+            Self::Up => "↑",
+            Self::Down => "↓",
+            Self::UpLeft => "↖",
+            Self::UpRight => "↗",
+            Self::DownLeft => "↙",
+            Self::DownRight => "↘",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(usize)]
+pub enum Action {
+    Unassigned,
+    Back,
+    Forward,
+    Home,
+    End,
+    Copy,
+    Paste,
+    Minimize,
+    Maximize,
+    Close,
+}
+pub const ACTIONS: [Action; 10] = [
+    Action::Unassigned,
+    Action::Back,
+    Action::Forward,
+    Action::Home,
+    Action::End,
+    Action::Copy,
+    Action::Paste,
+    Action::Minimize,
+    Action::Maximize,
+    Action::Close,
+];
+pub const DEFAULT_BINDINGS: [Action; 8] = [
+    Action::Back,
+    Action::Forward,
+    Action::Home,
+    Action::End,
+    Action::Unassigned,
+    Action::Unassigned,
+    Action::Unassigned,
+    Action::Unassigned,
+];
+impl Action {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unassigned => "未绑定",
+            Self::Back => "后退",
+            Self::Forward => "前进",
+            Self::Home => "页面顶部",
+            Self::End => "页面底部",
+            Self::Copy => "复制",
+            Self::Paste => "粘贴",
+            Self::Minimize => "最小化窗口",
+            Self::Maximize => "最大化／还原",
+            Self::Close => "关闭窗口",
         }
     }
 }
@@ -54,19 +134,31 @@ impl Stroke {
     pub fn direction(&self) -> Option<Direction> {
         let x = self.dx.abs();
         let y = self.dy.abs();
-        if x.max(y) < 24.0 || x.min(y) > 0.55 * x.max(y) || x.hypot(y) < 0.78 * self.length {
+        let displacement = x.hypot(y);
+        if displacement < 24. || displacement < 0.78 * self.length {
             return None;
         }
-        Some(if x > y {
-            if self.dx > 0.0 {
-                Direction::Right
-            } else {
+        // Equal 45-degree sectors in screen coordinates (+Y is down).
+        const TAN_HALF_SECTOR: f64 = std::f64::consts::SQRT_2 - 1.;
+        Some(if y <= x * TAN_HALF_SECTOR {
+            if self.dx < 0. {
                 Direction::Left
+            } else {
+                Direction::Right
             }
-        } else if self.dy > 0.0 {
-            Direction::Down
+        } else if x <= y * TAN_HALF_SECTOR {
+            if self.dy < 0. {
+                Direction::Up
+            } else {
+                Direction::Down
+            }
         } else {
-            Direction::Up
+            match (self.dx < 0., self.dy < 0.) {
+                (true, true) => Direction::UpLeft,
+                (false, true) => Direction::UpRight,
+                (true, false) => Direction::DownLeft,
+                (false, false) => Direction::DownRight,
+            }
         })
     }
 }
@@ -74,26 +166,40 @@ impl Stroke {
 mod tests {
     use super::*;
     #[test]
-    fn four_fixed_directions_match_their_preview() {
-        for (x, y, label) in [
-            (-60, 0, "后退"),
-            (60, 0, "前进"),
-            (0, -60, "页面顶部"),
-            (0, 60, "页面底部"),
+    fn eight_straight_directions_and_sector_boundaries() {
+        use Direction::*;
+        for (x, y, dir) in [
+            (-60, 0, Left),
+            (60, 0, Right),
+            (0, -60, Up),
+            (0, 60, Down),
+            (-50, -50, UpLeft),
+            (50, -50, UpRight),
+            (-50, 50, DownLeft),
+            (50, 50, DownRight),
+            (100, 41, Right),
+            (100, 42, DownRight),
+            (41, 100, Down),
+            (42, 100, DownRight),
         ] {
             let mut stroke = Stroke::new(0, 0);
             stroke.sample(x, y);
-            assert_eq!(stroke.direction().map(|d| d.labels().1), Some(label));
+            assert_eq!(stroke.direction(), Some(dir));
         }
     }
     #[test]
-    fn reject_jitter_diagonal_and_loops() {
-        for pts in [vec![(3, 2)], vec![(60, 60)], vec![(80, 0), (0, 0), (30, 0)]] {
+    fn reject_jitter_bends_and_loops() {
+        for points in [
+            vec![(3, 2)],
+            vec![(16, 16)],
+            vec![(60, 0), (60, 60)],
+            vec![(80, 0), (0, 0), (30, 0)],
+        ] {
             let mut s = Stroke::new(0, 0);
-            for (x, y) in pts {
-                s.sample(x, y)
+            for (x, y) in points {
+                s.sample(x, y);
             }
-            assert_eq!(s.direction(), None)
+            assert_eq!(s.direction(), None);
         }
     }
     #[test]

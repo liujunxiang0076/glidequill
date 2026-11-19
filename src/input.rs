@@ -11,6 +11,7 @@ use windows_sys::Win32::{Graphics::Gdi::*, System::Threading::*, UI::Input::Keyb
 
 struct Capture {
     target: HWND,
+    bindings: [glidequill::Action; glidequill::DIRECTIONS.len()],
     origin: POINT,
     dpi: u32,
     stroke: Stroke,
@@ -126,6 +127,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                     CAPTURE.with(|c| {
                         *c.borrow_mut() = Some(Capture {
                             target,
+                            bindings: settings::preferences().bindings,
                             origin: point,
                             dpi,
                             stroke: Stroke::new(0, 0),
@@ -146,7 +148,7 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             overlay::extend(
                                 SETTINGS_WINDOW.with(Cell::get),
                                 point,
-                                s.stroke.direction(),
+                                s.stroke.direction().map(|d| s.bindings[d as usize]),
                             );
                         }
                     }
@@ -165,7 +167,11 @@ unsafe fn gesture(msg: u32, point: POINT) -> bool {
                             replay_click();
                         }
                     } else {
-                        overlay::finish(window, point, s.stroke.direction());
+                        overlay::finish(
+                            window,
+                            point,
+                            s.stroke.direction().map(|d| s.bindings[d as usize]),
+                        );
                     }
                     true
                 } else {
@@ -240,11 +246,22 @@ mod tests {
             DwmFlush();
             let subtitle = overlay::test_subtitle();
             let start = POINT { x: 280, y: 240 };
+            // Load user bindings so the real HUD must follow the chosen action for each diagonal.
+            let test_dir =
+                std::env::temp_dir().join(format!("glidequill-bindings-{}", std::process::id()));
+            std::fs::create_dir(&test_dir).unwrap();
+            std::fs::write(test_dir.join("settings.json"),r#"{"bindings":["back","forward","home","end","copy","paste","minimize","unassigned"]}"#).unwrap();
+            settings::load_from(&test_dir).unwrap();
+            std::fs::remove_file(test_dir.join("settings.json")).unwrap();
+            std::fs::remove_dir(test_dir).unwrap();
             for (x, y, expected) in [
                 (180, 240, "后退"),
                 (380, 240, "前进"),
                 (280, 140, "页面顶部"),
                 (280, 340, "页面底部"),
+                (190, 150, "复制"),
+                (370, 150, "粘贴"),
+                (190, 330, "最小化窗口"),
                 (370, 330, ""),
             ] {
                 let end = POINT { x, y };

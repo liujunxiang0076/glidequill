@@ -1,5 +1,5 @@
 use super::*;
-use glidequill::Direction;
+use glidequill::Action;
 use std::{
     io,
     sync::Mutex,
@@ -22,7 +22,7 @@ struct Trail {
     visible: bool,
     dirty: bool,
     idle_deadline: Option<Instant>,
-    action: Option<Direction>,
+    action: Option<Action>,
     expires: Option<Instant>,
 }
 static TRAIL: Mutex<Trail> = Mutex::new(Trail {
@@ -37,7 +37,7 @@ static TRAIL: Mutex<Trail> = Mutex::new(Trail {
 });
 #[derive(Clone, Copy, PartialEq)]
 struct Subtitle {
-    action: Direction,
+    action: Action,
     x: i32,
     y: i32,
     width: i32,
@@ -84,7 +84,7 @@ fn append(points: &mut Vec<POINT>, pt: POINT) {
     }
     points.push(pt);
 }
-pub fn extend(window: HWND, pt: POINT, direction: Option<Direction>) {
+pub fn extend(window: HWND, pt: POINT, action: Option<Action>) {
     let mut state = TRAIL.lock().unwrap();
     if state.target == 0 {
         return;
@@ -100,7 +100,7 @@ pub fn extend(window: HWND, pt: POINT, direction: Option<Direction>) {
     }
     let timeout = settings::preferences().idle_ms;
     state.idle_deadline = (timeout > 0).then(|| now + Duration::from_millis(timeout.into()));
-    state.action = direction;
+    state.action = action;
     let first = !state.visible;
     append(&mut state.points, pt);
     state.visible = true;
@@ -110,7 +110,7 @@ pub fn extend(window: HWND, pt: POINT, direction: Option<Direction>) {
         notify(window);
     }
 }
-pub fn finish(window: HWND, pt: POINT, direction: Option<Direction>) {
+pub fn finish(window: HWND, pt: POINT, action: Option<Action>) {
     let mut state = TRAIL.lock().unwrap();
     if state.target == 0 {
         return;
@@ -127,7 +127,7 @@ pub fn finish(window: HWND, pt: POINT, direction: Option<Direction>) {
     append(&mut state.points, pt);
     state.visible = true;
     state.dirty = true;
-    state.action = direction;
+    state.action = action;
     state.expires = Some(now + Duration::from_millis(result_ms.into()));
     drop(state);
     notify(window);
@@ -254,12 +254,22 @@ pub unsafe fn refresh(window: HWND) {
             popup,
             &points,
             dpi,
-            (released && action.is_none()).then_some("未识别"),
+            if released {
+                match action {
+                    None => Some("未识别"),
+                    Some(Action::Unassigned) => Some("未绑定"),
+                    _ => None,
+                }
+            } else {
+                None
+            },
         ) {
             if IsWindowVisible(popup) == 0 {
                 ShowWindow(popup, SW_SHOWNOACTIVATE);
             }
-            if let (Some(action), Some(&end)) = (action, points.last()) {
+            if let (Some(action), Some(&end)) =
+                (action.filter(|a| *a != Action::Unassigned), points.last())
+            {
                 show_subtitle(action, end, dpi);
             } else {
                 hide_subtitle();
@@ -543,7 +553,7 @@ fn smooth_path(points: &[POINT], left: i32, top: i32, scale: f32) -> Vec<PointF>
     path
 }
 
-unsafe fn show_subtitle(action: Direction, end: POINT, fallback_dpi: u32) {
+unsafe fn show_subtitle(action: Action, end: POINT, fallback_dpi: u32) {
     unsafe {
         use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
         let monitor = MonitorFromPoint(end, MONITOR_DEFAULTTONEAREST);
@@ -563,7 +573,7 @@ unsafe fn show_subtitle(action: Direction, end: POINT, fallback_dpi: u32) {
         let scale = dpi as f32 / 96.;
         let px = |v: f32| (v * scale).round() as i32;
         let work = info.rcWork;
-        let label = action.labels().1;
+        let label = action.label();
         let width = px(48. + label.chars().count() as f32 * 23.).min(work.right - work.left);
         let height = px(48.).min(work.bottom - work.top);
         let subtitle = Subtitle {

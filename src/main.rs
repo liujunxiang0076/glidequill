@@ -8,7 +8,7 @@ mod overlay;
 mod settings;
 mod startup;
 mod ui;
-use glidequill::DIRECTIONS;
+use glidequill::{ACTIONS, DIRECTIONS};
 use std::{
     cell::{Cell, RefCell},
     mem::size_of,
@@ -57,6 +57,7 @@ thread_local! {
     static DARK:Cell<bool>=const{Cell::new(false)};
     static WINDOW:Cell<HWND>=const{Cell::new(null_mut())};
     static LISTENER:RefCell<Option<engine::Listener>>=const{RefCell::new(None)};
+    static TRAY_ICON:Cell<HICON>=const{Cell::new(null_mut())};
     static TRAY_OK:Cell<bool>=const{Cell::new(false)};
     static TASKBAR:Cell<u32>=const{Cell::new(0)};
 }
@@ -248,7 +249,7 @@ unsafe fn notify(op: u32) -> bool {
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: TRAY,
-            hIcon: GetClassLongPtrW(app_window(), GCLP_HICON) as HICON,
+            hIcon: TRAY_ICON.with(Cell::get),
             ..Default::default()
         };
         let tip = wide("GlideQuill · 拂标");
@@ -310,6 +311,11 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 overlay::refresh(w);
                 0
             }
+            WM_MEASUREITEM => {
+                let item = &mut *(lp as *mut windows_sys::Win32::UI::Controls::MEASUREITEMSTRUCT);
+                item.itemHeight = ui::px(26) as u32;
+                1
+            }
             WM_DRAWITEM => {
                 ui::item(&*(lp as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT));
                 1
@@ -327,6 +333,37 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     return 0;
                 }
                 match id {
+                    id if (ui::PICKER..ui::PICKER + DIRECTIONS.len() as i32).contains(&id)
+                        && wp >> 16 == CBN_SELCHANGE as usize =>
+                    {
+                        let field = GetDlgItem(w, id);
+                        let index = (id - ui::PICKER) as usize;
+                        let mut prefs = settings::preferences();
+                        let previous = prefs.bindings[index];
+                        let selected = SendMessageW(field, CB_GETCURSEL, 0, 0);
+                        if CONFIG_READABLE.with(Cell::get)
+                            && let Some(&action) = ACTIONS.get(selected as usize)
+                        {
+                            prefs.bindings[index] = action;
+                            match settings::save(prefs) {
+                                Ok(()) => label(
+                                    RESULT,
+                                    &format!(
+                                        "已保存 · {}划 → {}",
+                                        DIRECTIONS[index].name(),
+                                        action.label()
+                                    ),
+                                ),
+                                Err(e) => {
+                                    SendMessageW(field, CB_SETCURSEL, previous as usize, 0);
+                                    label(RESULT, &format!("绑定保存失败：{e}"));
+                                }
+                            }
+                        } else {
+                            SendMessageW(field, CB_SETCURSEL, previous as usize, 0);
+                        }
+                        InvalidateRect(field, null_mut(), 0);
+                    }
                     AUTOSTART => {
                         match refresh_startup()
                             .and_then(|on| startup::set(!on))
@@ -443,7 +480,7 @@ unsafe fn frame_size(dpi: u32) -> RECT {
         bottom: ui::px(ui::HEIGHT),
     };
     unsafe {
-        AdjustWindowRectExForDpi(&mut frame, WINDOW_STYLE, 0, 0, dpi);
+        AdjustWindowRectExForDpi(&mut frame, WINDOW_STYLE, 0, WS_EX_DLGMODALFRAME, dpi);
     }
     frame
 }
@@ -502,9 +539,10 @@ fn main() {
             96,
             LR_DEFAULTCOLOR,
         );
+        TRAY_ICON.with(|v| v.set(icon));
         let wc = WNDCLASSW {
             hInstance: inst,
-            hIcon: icon,
+
             lpszClassName: class.as_ptr(),
             lpfnWndProc: Some(proc),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
@@ -518,9 +556,9 @@ fn main() {
         ui::set_dpi(dpi);
         let frame = frame_size(dpi);
         let hwnd = CreateWindowExW(
-            0,
+            WS_EX_DLGMODALFRAME,
             class.as_ptr(),
-            wide("GlideQuill · 设置").as_ptr(),
+            wide("设置").as_ptr(),
             WINDOW_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -552,7 +590,10 @@ fn main() {
         apply_theme(hwnd, prefs.dark);
         if let Some(ref e) = error {
             label(RESULT, &format!("配置读取失败，已暂停：{e}"));
-            for id in [TOGGLE, IDLE, LINGER, THEME] {
+            for id in [TOGGLE, IDLE, LINGER, THEME]
+                .into_iter()
+                .chain(ui::PICKER..ui::PICKER + DIRECTIONS.len() as i32)
+            {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
                     GetDlgItem(hwnd, id),
                     0,

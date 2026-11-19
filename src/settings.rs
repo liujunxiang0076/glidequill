@@ -18,12 +18,14 @@ pub const RESULT_VALUES: [u32; 5] = [0, 250, 550, 1000, 2000];
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
+    pub bindings: [glidequill::Action; glidequill::DIRECTIONS.len()],
     pub enabled: bool,
     pub dark: bool,
     pub idle_ms: u32,
     pub result_ms: u32,
 }
 const DEFAULTS: Preferences = Preferences {
+    bindings: glidequill::DEFAULT_BINDINGS,
     enabled: false,
     dark: false,
     idle_ms: 500,

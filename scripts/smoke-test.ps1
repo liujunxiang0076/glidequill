@@ -84,18 +84,33 @@ $legacyDir = Join-Path $root 'GlideQuill'
 $legacyFile = Join-Path $legacyDir 'rules.json'
 $legacy = '{"global":["Close","Minimize","Paste","Copy"],"browser":["Home","End","Off","Off"],"excluded":["blocked.exe"]}'
 [IO.File]::WriteAllText($legacyFile,$legacy)
+$prefsFile=Join-Path $legacyDir 'settings.json'
+[IO.File]::WriteAllText($prefsFile,'{"enabled":false,"dark":false,"idle_ms":1000,"result_ms":550}')
 $p = Start-TestApp
 try {
     $w=$p.MainWindowHandle
     Require ((Get-Label $w 121) -eq '启用全局手势') 'Unexpected startup hook state'
     Require ([GestureSmoke]::AreDpiAwarenessContextsEqual([GestureSmoke]::GetWindowDpiAwarenessContext($w), [IntPtr](-4))) 'Window must render at per-monitor DPI v2'
-    $expected = @('向左划 · 后退','向右划 · 前进','向上划 · 页面顶部','向下划 · 页面底部')
-    foreach ($i in 0..3) { Require ((Get-Label $w (140+$i)) -eq $expected[$i]) 'Wrong preset' }
+    $names = @('向左','向右','向上','向下','左上','右上','左下','右下')
+    $defaults = @(1,2,3,4,0,0,0,0)
+    foreach ($i in 0..7) {
+        Require ((Get-Label $w (140+$i)) -eq $names[$i]) 'Wrong direction'
+        $field=[GestureSmoke]::GetDlgItem($w,(160+$i))
+        Require ((Send $field 0x146).ToInt32() -eq 10) 'Missing choices'
+        Require ((Send $field 0x147).ToInt32() -eq $defaults[$i]) 'Wrong default action'
+    }
     foreach ($id in @(110,120,125,126)) {
         Require ([GestureSmoke]::GetDlgItem($w,$id) -eq [IntPtr]::Zero) 'Obsolete editor control'
     }
     Write-Output ("Window DPI: {0}" -f [GestureSmoke]::GetDpiForWindow($w))
     Save-Screenshot $w 'windows-light.png'
+    $diagonal=[GestureSmoke]::GetDlgItem($w,165)
+    [void](Send $diagonal 0x14f 1)
+    Require ((Send $diagonal 0x157).ToInt32() -ne 0) 'Dropdown did not open'
+    foreach ($step in 1..5) { [void](Send $diagonal 0x100 0x28) }
+    [void](Send $diagonal 0x100 0x0d)
+    $saved=Get-Content $prefsFile -Raw | ConvertFrom-Json
+    Require ($saved.bindings[5] -eq 'copy' -and $saved.idle_ms -eq 1000) 'Keyboard selection or preference preservation failed'
     [void](Send $w 0x111 130)
     Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,131))) 'Missing general settings'
     Require (![GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,132))) 'Timing control visible in General'
@@ -138,7 +153,7 @@ try {
     $p=[Diagnostics.Process]::Start($start)
     $deadline=[Diagnostics.Stopwatch]::StartNew()
     do {
-        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","GlideQuill · 设置")
+        $w=[GestureSmoke]::FindWindow("GlideQuill.Rules.0.1.test.$testId","设置")
         if ($w -ne 0 -and (Get-Label $w 121) -eq '暂停全局手势') {break}
         Start-Sleep -Milliseconds 40
     } while (!$p.HasExited -and $deadline.ElapsedMilliseconds -lt 5000)
@@ -146,6 +161,7 @@ try {
     Require (![GestureSmoke]::IsWindowVisible($w)) 'Logon launched a visible window'
     [void](Send $w 0x111 123)
     [void](Send $w 0x111 130)
+    Require ((Send ([GestureSmoke]::GetDlgItem($w,165)) 0x147).ToInt32() -eq 5) 'Diagonal binding not restored'
     Require ((Get-Label $w 127) -eq '浅色') 'Theme was not restored'
     Require ((Get-Label $w 132) -like '*2 秒') 'Idle setting was not restored'
     Require ((Get-Label $w 133) -like '*0.25 秒') 'Result setting was not restored'
@@ -160,7 +176,7 @@ try {
     Require ((Get-Label $p.MainWindowHandle 121) -eq '启用全局手势') 'Paused state not restored'
     [void](Send $p.MainWindowHandle 0x111 124)
     Require ($p.WaitForExit(5000)) 'Final exit failed'
-    Write-Output 'PASS: persisted settings and pause, isolated logon registration and tray startup, four read-only rules, preview switch, theme, tray, single-instance and legacy config preservation.'
+    Write-Output 'PASS: persisted settings and pause, isolated logon registration and tray startup, eight direction dropdowns and binding persistence, preview switch, theme, tray, single-instance and legacy config preservation.'
 } finally {
     if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
     if (Test-Path -LiteralPath $testKey) {Remove-Item -LiteralPath $testKey}
