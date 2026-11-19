@@ -181,13 +181,31 @@ unsafe fn edit_command(target: HWND, focus: HWND, copy: bool) {
     }
 }
 
+// Custom-framed applications can expose a minimize box without a system menu.
+// Ask Windows to minimize the captured window without blocking the input thread.
+unsafe fn minimize(target: HWND) {
+    unsafe {
+        let style = GetWindowLongW(target, GWL_STYLE) as u32;
+        if style & WS_MINIMIZEBOX == 0 {
+            return;
+        }
+        if style & WS_SYSMENU != 0 {
+            let menu = GetSystemMenu(target, 0);
+            if !menu.is_null() {
+                let state = GetMenuState(menu, SC_MINIMIZE, MF_BYCOMMAND);
+                if state != u32::MAX && state & (MF_DISABLED | MF_GRAYED) != 0 {
+                    return;
+                }
+            }
+        }
+        ShowWindowAsync(target, SW_MINIMIZE);
+    }
+}
+
 unsafe fn window_command(target: HWND, command: u32) {
     unsafe {
         let style = GetWindowLongW(target, GWL_STYLE) as u32;
-        if style & WS_SYSMENU == 0
-            || (command == SC_MINIMIZE && style & WS_MINIMIZEBOX == 0)
-            || (command == SC_MAXIMIZE && style & WS_MAXIMIZEBOX == 0)
-        {
+        if style & WS_SYSMENU == 0 || (command == SC_MAXIMIZE && style & WS_MAXIMIZEBOX == 0) {
             return;
         }
         let menu = GetSystemMenu(target, 0);
@@ -215,7 +233,7 @@ unsafe fn execute(target: HWND, action: Action) {
                     edit_command(target, focus, action == Action::Copy);
                 }
             }
-            Action::Minimize => window_command(target, SC_MINIMIZE),
+            Action::Minimize => minimize(target),
             Action::Maximize => window_command(
                 target,
                 if IsZoomed(target) != 0 {
@@ -351,6 +369,9 @@ unsafe fn replay_click() {
     }
 }
 #[cfg(test)]
+static DESKTOP_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ui, wide};
@@ -369,6 +390,7 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive Windows desktop"]
     fn native_trail_shows_before_release_and_preserves_the_foreground() {
+        let _desktop = DESKTOP_TEST.lock().unwrap();
         unsafe {
             use windows_sys::Win32::Graphics::Dwm::DwmFlush;
             use windows_sys::Win32::UI::HiDpi::*;
@@ -768,13 +790,16 @@ mod tests {
             for (action, command) in [
                 (Action::Maximize, SC_MAXIMIZE),
                 (Action::Maximize, SC_RESTORE),
-                (Action::Minimize, SC_MINIMIZE),
                 (Action::Close, SC_CLOSE),
             ] {
                 if action == Action::Close {
-                    assert_ne!(IsIconic(sample), 0);
-                    ShowWindow(sample, SW_RESTORE);
-                    SetForegroundWindow(sample);
+                    let menu = GetSystemMenu(sample, 0);
+                    EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_GRAYED);
+                    execute(sample, Action::Minimize);
+                    let mut msg = MSG::default();
+                    PeekMessageW(&mut msg, sample, 0, 0, PM_NOREMOVE);
+                    assert_eq!(IsIconic(sample), 0, "explicitly disabled minimize");
+                    EnableMenuItem(menu, SC_MINIMIZE, MF_BYCOMMAND | MF_ENABLED);
                 }
                 execute(sample, action);
                 let messages = received(sample, WM_SYSCOMMAND);
@@ -791,3 +816,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod browser_tests;
