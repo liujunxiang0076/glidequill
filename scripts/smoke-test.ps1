@@ -1,5 +1,5 @@
 # Run after cargo build --release. Only send messages to the test instance.
-param([string]$Executable, [string]$ScreenshotDirectory)
+param([string]$Executable, [string]$ScreenshotDirectory, [switch]$MeasureNavigation)
 $ErrorActionPreference = 'Stop'
 if (!$Executable) { $Executable = Join-Path $PSScriptRoot '../target/release/glidequill.exe' }
 $exe = (Resolve-Path $Executable).Path
@@ -31,6 +31,16 @@ public static class GestureSmoke {
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
+    [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr w, IntPtr rect, IntPtr region, uint flags);
+    public static double ClickAndPaint(IntPtr w,int id) {
+        var button = GetDlgItem(w,id);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        SendMessage(button,0x201,(IntPtr)1,(IntPtr)0x00080008);
+        SendMessage(button,0x202,IntPtr.Zero,(IntPtr)0x00080008);
+        // Drain outstanding paints for the window and all its children; exclude compositor vsync.
+        RedrawWindow(w,IntPtr.Zero,IntPtr.Zero,0x180);
+        return clock.Elapsed.TotalMilliseconds;
+    }
     [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
 }
@@ -115,6 +125,17 @@ try {
         Require ([Math]::Abs($frame.Left+$frame.Right-$info.Work.Left-$info.Work.Right) -le 1) 'Window not centered horizontally'
         Require ([Math]::Abs($frame.Top+$frame.Bottom-$info.Work.Top-$info.Work.Bottom) -le 1) 'Window not centered vertically'
     } finally { [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior) }
+    if ($MeasureNavigation) {
+        $samples=foreach($round in 0..32) {
+            [void][GestureSmoke]::ClickAndPaint($w,130)
+            Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,131))) 'General page did not activate'
+            $ms=[GestureSmoke]::ClickAndPaint($w,134)
+            Require ([GestureSmoke]::IsWindowVisible([GestureSmoke]::GetDlgItem($w,160))) 'Rules page did not activate'
+            if ($round -ge 3) { $ms }
+        }
+        $sorted=@($samples | Sort-Object)
+        Write-Output ('General -> Rules, 30 warm switches: median {0:N2} ms, P95 {1:N2} ms (input to native paint, {2} DPI)' -f (($sorted[14]+$sorted[15])/2),$sorted[28],[GestureSmoke]::GetDpiForWindow($w))
+    }
     # A compact client area must keep both rule columns and footer actions accessible.
     $prior=[GestureSmoke]::SetThreadDpiAwarenessContext([IntPtr](-4))
     $scale=[GestureSmoke]::GetDpiForWindow($w)/96.0
@@ -194,6 +215,8 @@ try {
         Require ([GestureSmoke]::ClientToScreen($diagonal,[ref]$target)) 'No screen position'
         Require ([GestureSmoke]::GetPhysicalCursorPos([ref]$original)) 'Missing initial cursor'
         try {
+            # Keep this isolated picker reachable when the regular settings window is also open.
+            Require ([GestureSmoke]::SetWindowPos($w,[IntPtr](-1),0,0,0,0,0x13)) 'Cannot raise test picker'
             Require ([GestureSmoke]::SetPhysicalCursorPos($target.X,$target.Y)) 'Cannot hover picker'
             Start-Sleep -Milliseconds 120
             Require ([GestureSmoke]::WindowFromPoint($target) -eq $diagonal) 'Picker is covered during hover test'
@@ -204,7 +227,10 @@ try {
             Require ((Send $diagonal 0x147).ToInt32() -eq 5) 'Releasing outside the clear target cleared a binding'
             [void](Send $diagonal 0x201 1 $point)
             [void](Send $diagonal 0x202 0 $point)
-        } finally { [void][GestureSmoke]::SetPhysicalCursorPos($original.X,$original.Y) }
+        } finally {
+            [void][GestureSmoke]::SetPhysicalCursorPos($original.X,$original.Y)
+            [void][GestureSmoke]::SetWindowPos($w,[IntPtr](-2),0,0,0,0,0x13)
+        }
     } finally {
         [void][GestureSmoke]::SetThreadDpiAwarenessContext($prior)
     }

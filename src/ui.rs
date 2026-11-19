@@ -2,7 +2,8 @@ use super::*;
 use std::time::Instant;
 use windows_sys::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, WM_MOUSELEAVE,
+    BPBF_TOPDOWNDIB, BeginBufferedPaint, BufferedPaintInit, BufferedPaintUnInit, DRAWITEMSTRUCT,
+    EndBufferedPaint, ODS_DISABLED, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
@@ -10,8 +11,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 // Layout is in device-independent pixels. Convert once at each drawing/Win32 boundary.
-pub const WIDTH: i32 = 800;
-pub const HEIGHT: i32 = 438;
+pub const WIDTH: i32 = 940;
+pub const HEIGHT: i32 = 550;
 #[derive(Clone, Copy)]
 struct Layout {
     width: i32,
@@ -24,16 +25,36 @@ struct Layout {
     row_height: i32,
     column: i32,
     setting_height: i32,
+    roomy: bool,
 }
 impl Layout {
     const fn new(width: i32, height: i32) -> Self {
-        let rail = if width < 690 { 56 } else { 148 };
-        let gutter = if width < 740 { 16 } else { 24 };
+        let roomy = width >= 825 && height >= 480;
+        let rail = if width < 690 {
+            56
+        } else if roomy {
+            168
+        } else {
+            148
+        };
+        let gutter = if width < 740 {
+            16
+        } else if roomy {
+            30
+        } else {
+            24
+        };
         let left = rail + gutter;
         let right = width - gutter;
-        let card_top = if height < 380 { 76 } else { 88 };
-        let row_start = card_top + 44;
-        let row_height = (height - row_start - 76) / 4;
+        let card_top = if height < 380 {
+            76
+        } else if roomy {
+            100
+        } else {
+            88
+        };
+        let row_start = card_top + if roomy { 54 } else { 44 };
+        let row_height = (height - row_start - if roomy { 88 } else { 76 }) / 4;
         Self {
             width,
             height,
@@ -44,7 +65,8 @@ impl Layout {
             row_start,
             row_height,
             column: (right - left - 2) / 2,
-            setting_height: (height - card_top - 72) / 3,
+            setting_height: (height - card_top - if roomy { 88 } else { 72 }) / 3,
+            roomy,
         }
     }
 }
@@ -67,7 +89,10 @@ const COUNT: i32 = GESTURES.len() as i32;
 pub const RULE_ROW: i32 = 140;
 thread_local! { static DPI: Cell<u32> = const { Cell::new(96) }; }
 pub fn set_dpi(dpi: u32) {
-    DPI.with(|v| v.set(if dpi == 0 { 96 } else { dpi }));
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    if DPI.replace(dpi) != dpi {
+        FONTS.with_borrow_mut(Vec::clear);
+    }
 }
 pub fn px(dip: i32) -> i32 {
     DPI.with(|dpi| (dip as f64 * dpi.get() as f64 / 96.0).round() as i32)
@@ -150,7 +175,10 @@ impl PointerState {
 }
 
 // Keep GDI+ active for the lifetime of the native window and its child controls.
-pub struct GraphicsSession(usize);
+pub struct GraphicsSession {
+    gdiplus: usize,
+    buffered: bool,
+}
 impl GraphicsSession {
     pub fn start() -> Self {
         let mut token = 0;
@@ -161,13 +189,44 @@ impl GraphicsSession {
         unsafe {
             GdiplusStartup(&mut token, &input, null_mut());
         }
-        Self(token)
+        Self {
+            gdiplus: token,
+            buffered: unsafe { BufferedPaintInit() >= 0 },
+        }
     }
 }
 impl Drop for GraphicsSession {
     fn drop(&mut self) {
-        if self.0 != 0 {
-            unsafe { GdiplusShutdown(self.0) };
+        if self.buffered {
+            unsafe { BufferedPaintUnInit() };
+        }
+        if self.gdiplus != 0 {
+            unsafe { GdiplusShutdown(self.gdiplus) };
+        }
+    }
+}
+// Composite each invalid region once. Drawing GDI+ shapes directly to the
+// display DC forces repeated transfers between GDI and the window surface.
+struct PaintBuffer {
+    handle: isize,
+    dc: HDC,
+}
+impl PaintBuffer {
+    unsafe fn new(target: HDC, bounds: &RECT) -> Self {
+        let mut dc = null_mut();
+        let handle = unsafe {
+            BeginBufferedPaint(target, bounds, BPBF_TOPDOWNDIB, std::ptr::null(), &mut dc)
+        };
+        Self {
+            handle,
+            dc: if handle == 0 { target } else { dc },
+        }
+    }
+}
+impl Drop for PaintBuffer {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe { EndBufferedPaint(self.handle, 1) };
         }
     }
 }
@@ -310,111 +369,93 @@ unsafe fn draw_turn(dc: HDC, tile: RECT, incoming: (f64, f64), outgoing: (f64, f
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
 enum Face {
     Body,
     Strong,
     Arrow,
     Icon,
 }
-unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u32, align: u32) {
-    unsafe {
+
+struct UiFont {
+    face: Face,
+    height: i32,
+    handle: HFONT,
+}
+impl Drop for UiFont {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.handle);
+        }
+    }
+}
+thread_local! {
+    static FONTS:RefCell<Vec<UiFont>>=const {RefCell::new(Vec::new())};
+}
+fn font(face: Face, size: i32) -> HFONT {
+    let height = -px(size);
+    FONTS.with_borrow_mut(|cache| {
+        if let Some(font) = cache.iter().find(|f| f.face == face && f.height == height) {
+            return font.handle;
+        }
         let family = match face {
             Face::Icon => "Segoe MDL2 Assets",
             Face::Arrow => "Segoe UI Symbol",
             _ => "Microsoft YaHei UI",
         };
-        let weight = if matches!(face, Face::Strong) {
-            600
-        } else {
-            400
+        let weight = if face == Face::Strong { 600 } else { 400 };
+        let handle = unsafe {
+            CreateFontW(
+                height,
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                0,
+                0,
+                CLEARTYPE_QUALITY as u32,
+                0,
+                wide(family).as_ptr(),
+            )
         };
-        let font = CreateFontW(
-            -px(size),
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            0,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            wide(family).as_ptr(),
+        if !handle.is_null() {
+            cache.push(UiFont {
+                face,
+                height,
+                handle,
+            });
+        }
+        handle
+    })
+}
+unsafe fn text(dc: HDC, s: &str, mut area: RECT, size: i32, face: Face, color: u32, align: u32) {
+    unsafe {
+        let old = SelectObject(dc, font(face, size));
+        let mode = SetBkMode(dc, TRANSPARENT as i32);
+        let ink = SetTextColor(dc, color);
+        DrawTextW(
+            dc,
+            wide(s).as_mut_ptr(),
+            -1,
+            &mut area,
+            DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | align,
         );
-        let old = SelectObject(dc, font);
-        let mut graphics = null_mut();
-        let mut glyph_font = null_mut();
-        let mut brush = null_mut();
-        let mut format = null_mut();
-        let label = wide(s);
-        let layout = RectF {
-            X: area.left as f32,
-            Y: area.top as f32,
-            Width: (area.right - area.left) as f32,
-            Height: (area.bottom - area.top) as f32,
-        };
-        let drawn = GdipCreateFromHDC(dc, &mut graphics) == Ok
-            && GdipCreateFontFromDC(dc, &mut glyph_font) == Ok
-            && GdipCreateSolidFill(0xff000000 | rgb(color), &mut brush) == Ok
-            && GdipCreateStringFormat(StringFormatFlagsNoWrap, 0, &mut format) == Ok
-            && {
-                GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAliasGridFit);
-                GdipSetStringFormatAlign(
-                    format,
-                    if align == DT_CENTER {
-                        StringAlignmentCenter
-                    } else {
-                        StringAlignmentNear
-                    },
-                );
-                GdipSetStringFormatLineAlign(format, StringAlignmentCenter);
-                GdipSetStringFormatTrimming(format, StringTrimmingEllipsisCharacter);
-                GdipDrawString(
-                    graphics,
-                    label.as_ptr(),
-                    -1,
-                    glyph_font,
-                    &layout,
-                    format,
-                    brush.cast(),
-                ) == Ok
-            };
-        if !format.is_null() {
-            GdipDeleteStringFormat(format);
-        }
-        if !brush.is_null() {
-            GdipDeleteBrush(brush.cast());
-        }
-        if !glyph_font.is_null() {
-            GdipDeleteFont(glyph_font);
-        }
-        if !graphics.is_null() {
-            GdipDeleteGraphics(graphics);
-        }
-        if !drawn {
-            SetBkMode(dc, TRANSPARENT as i32);
-            SetTextColor(dc, color);
-            DrawTextW(
-                dc,
-                wide(s).as_mut_ptr(),
-                -1,
-                &mut area,
-                DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | align,
-            );
-        }
+        SetTextColor(dc, ink);
+        SetBkMode(dc, mode);
         SelectObject(dc, old);
-        DeleteObject(font);
     }
 }
 fn control_bounds(id: i32) -> [i32; 4] {
     let l = LAYOUT.with(Cell::get);
+    if let Some(index) = Page::ALL.iter().position(|page| *page as i32 == id) {
+        let (top, height, gap) = if l.roomy { (22, 44, 7) } else { (16, 38, 5) };
+        return [10, top + index as i32 * (height + gap), l.rail - 20, height];
+    }
     match id {
-        id if id == Page::General as i32 => [10, 16, l.rail - 20, 38],
-        id if id == Page::Rules as i32 => [10, 59, l.rail - 20, 38],
-        id if id == Page::Feedback as i32 => [10, 102, l.rail - 20, 38],
         TOGGLE if PAGE.with(Cell::get) == Page::General => [
             l.right - 125,
             l.card_top + (l.setting_height - 34) / 2,
@@ -422,8 +463,12 @@ fn control_bounds(id: i32) -> [i32; 4] {
             34,
         ],
         TOGGLE => [l.right - 113, 20, 113, 34],
+        BASIC_TAB if l.roomy => [l.left + 14, l.card_top + 9, 88, 36],
+        SPECIAL_TAB if l.roomy => [l.left + 108, l.card_top + 9, 88, 36],
         BASIC_TAB => [l.left + 10, l.card_top + 7, 80, 30],
         SPECIAL_TAB => [l.left + 96, l.card_top + 7, 80, 30],
+        RESET_RULES if l.roomy => [l.right - 204, l.height - 58, 78, 36],
+        SAVE_RULES if l.roomy => [l.right - 116, l.height - 58, 116, 36],
         RESET_RULES => [l.right - 180, l.height - 48, 68, 32],
         SAVE_RULES => [l.right - 102, l.height - 48, 102, 32],
         AUTOSTART => [
@@ -452,25 +497,39 @@ fn control_bounds(id: i32) -> [i32; 4] {
         ],
         RESULT => [
             l.left,
-            l.height - 48,
+            if l.roomy {
+                l.height - 58
+            } else {
+                l.height - 48
+            },
             l.right
                 - l.left
                 - if PAGE.with(Cell::get) == Page::Rules {
-                    188
+                    if l.roomy { 216 } else { 188 }
                 } else {
                     0
                 },
-            32,
+            if l.roomy { 36 } else { 32 },
         ],
         _ => {
             let picker = id >= PICKER;
             let index = (id - if picker { PICKER } else { RULE_ROW }) % BASIC_COUNT as i32;
             let x = l.left + 1 + index / 4 * l.column;
             let y = l.row_start + index % 4 * l.row_height;
-            if picker {
-                [x + 112, y + (l.row_height - 30) / 2, l.column - 126, 330]
+            let (label, height, gap) = if l.roomy {
+                (132, 36, 18)
             } else {
-                [x + 1, y + 1, 109, l.row_height - 2]
+                (112, 30, 14)
+            };
+            if picker {
+                [
+                    x + label,
+                    y + (l.row_height - height) / 2,
+                    l.column - label - gap,
+                    330,
+                ]
+            } else {
+                [x + 1, y + 1, label - 3, l.row_height - 2]
             }
         }
     }
@@ -493,43 +552,66 @@ fn controls() -> impl Iterator<Item = i32> {
     .chain(RULE_ROW..RULE_ROW + COUNT)
     .chain(PICKER..PICKER + COUNT)
 }
+fn visible_on(id: i32, page: Page) -> bool {
+    match id {
+        THEME | AUTOSTART => page == Page::General,
+        IDLE | LINGER => page == Page::Feedback,
+        TOGGLE => page != Page::Feedback,
+        RESET_RULES | SAVE_RULES | BASIC_TAB | SPECIAL_TAB => page == Page::Rules,
+        id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
+            page == Page::Rules && rule_range().contains(&((id - RULE_ROW) as usize))
+        }
+        id if (PICKER..PICKER + COUNT).contains(&id) => {
+            page == Page::Rules && rule_range().contains(&((id - PICKER) as usize))
+        }
+        _ => true,
+    }
+}
+// Geometry changes on resize/DPI. Navigation changes visibility and only moves
+// the two controls shared between pages at different positions.
+unsafe fn place(id: i32, visible: bool, move_control: bool) {
+    let [x, y, width, height] = control_bounds(id).map(px);
+    let visibility = if visible {
+        SWP_SHOWWINDOW
+    } else {
+        SWP_HIDEWINDOW
+    };
+    let geometry = if move_control {
+        0
+    } else {
+        SWP_NOMOVE | SWP_NOSIZE
+    };
+    unsafe {
+        SetWindowPos(
+            GetDlgItem(app_window(), id),
+            null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | visibility | geometry,
+        );
+    }
+}
 pub unsafe fn layout() {
     unsafe {
+        let page = PAGE.get();
         for id in controls() {
-            let page = PAGE.with(Cell::get);
-            let visible = match id {
-                THEME | AUTOSTART => page == Page::General,
-                IDLE | LINGER => page == Page::Feedback,
-                TOGGLE => page != Page::Feedback,
-                RESET_RULES | SAVE_RULES | BASIC_TAB | SPECIAL_TAB => page == Page::Rules,
-                id if (RULE_ROW..RULE_ROW + COUNT).contains(&id) => {
-                    page == Page::Rules && rule_range().contains(&((id - RULE_ROW) as usize))
-                }
-                id if (PICKER..PICKER + COUNT).contains(&id) => {
-                    page == Page::Rules && rule_range().contains(&((id - PICKER) as usize))
-                }
-                _ => true,
-            };
-            let [x, y, w, h] = control_bounds(id).map(px);
-            SetWindowPos(
-                GetDlgItem(app_window(), id),
-                null_mut(),
-                x,
-                y,
-                w,
-                h,
-                SWP_NOACTIVATE
-                    | SWP_NOZORDER
-                    | if visible {
-                        SWP_SHOWWINDOW
-                    } else {
-                        SWP_HIDEWINDOW
-                    },
-            );
+            place(id, visible_on(id, page), true);
             if (PICKER..PICKER + COUNT).contains(&id) {
                 let field = GetDlgItem(app_window(), id);
-                SendMessageW(field, CB_SETITEMHEIGHT, 0, px(28) as isize);
-                SendMessageW(field, CB_SETITEMHEIGHT, usize::MAX, px(26) as isize);
+                SendMessageW(
+                    field,
+                    CB_SETITEMHEIGHT,
+                    0,
+                    px(if LAYOUT.get().roomy { 32 } else { 28 }) as isize,
+                );
+                SendMessageW(
+                    field,
+                    CB_SETITEMHEIGHT,
+                    usize::MAX,
+                    px(if LAYOUT.get().roomy { 32 } else { 26 }) as isize,
+                );
             }
         }
         RedrawWindow(
@@ -538,6 +620,24 @@ pub unsafe fn layout() {
             null_mut(),
             RDW_INVALIDATE | RDW_ALLCHILDREN,
         );
+    }
+}
+pub unsafe fn switch_page(previous: Page, page: Page) {
+    unsafe {
+        let w = app_window();
+        for id in controls() {
+            let visible = visible_on(id, page);
+            let moves = matches!(id, TOGGLE | RESULT);
+            if visible != visible_on(id, previous) || moves {
+                place(id, visible, moves);
+            }
+        }
+        let l = LAYOUT.get();
+        let content = bounds(l.rail, 0, l.width, l.height);
+        RedrawWindow(w, &content, null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+        for changed in [previous, page] {
+            InvalidateRect(GetDlgItem(w, changed as i32), null_mut(), 0);
+        }
     }
 }
 pub unsafe fn switch_group() {
@@ -861,6 +961,8 @@ unsafe extern "system" fn action_field(
             };
             let mut r = RECT::default();
             GetClientRect(w, &mut r);
+            let buffer = PaintBuffer::new(dc, &r);
+            let dc = buffer.dc;
             let p = colors();
             let focus = GetFocus() == w;
             fill(dc, r, p.surface);
@@ -898,6 +1000,7 @@ unsafe extern "system" fn action_field(
                 chevron.left
             };
             text(dc, &caption(w), r, 14, Face::Body, p.text, 0);
+            drop(buffer);
             if m == WM_PAINT {
                 EndPaint(w, &ps);
             }
@@ -915,7 +1018,9 @@ pub unsafe fn paint(w: HWND) {
         let p = colors();
         let l = LAYOUT.with(Cell::get);
         let mut ps = PAINTSTRUCT::default();
-        let dc = BeginPaint(w, &mut ps);
+        let target = BeginPaint(w, &mut ps);
+        let buffer = PaintBuffer::new(target, &ps.rcPaint);
+        let dc = buffer.dc;
         fill(dc, bounds(0, 0, l.width, l.height), p.base);
         fill(dc, bounds(0, 0, l.rail, l.height), p.rail);
         fill(dc, bounds(l.rail - 1, 0, l.rail, l.height), p.edge);
@@ -1032,11 +1137,9 @@ pub unsafe fn paint(w: HWND) {
                 );
             }
         }
-        fill(
-            dc,
-            bounds(l.left, l.height - 62, l.right, l.height - 61),
-            p.edge,
-        );
+        let divider = l.height - if l.roomy { 74 } else { 62 };
+        fill(dc, bounds(l.left, divider, l.right, divider + 1), p.edge);
+        drop(buffer);
         EndPaint(w, &ps);
     }
 }
@@ -1044,8 +1147,9 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
     unsafe {
         let p = colors();
         let id = item.CtlID as i32;
-        let dc = item.hDC;
         let r = item.rcItem;
+        let buffer = PaintBuffer::new(item.hDC, &r);
+        let dc = buffer.dc;
         let state = if item.itemState & ODS_DISABLED != 0 {
             PointerState::Idle
         } else if item.itemState & ODS_SELECTED != 0 {
@@ -1058,12 +1162,14 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
         if (RULE_ROW..RULE_ROW + COUNT).contains(&id) {
             let dir = GESTURES[(id - RULE_ROW) as usize];
             fill(dc, r, p.surface);
-            let side = px(32).min(r.bottom - px(4));
+            let roomy = LAYOUT.get().roomy;
+            let side = px(if roomy { 38 } else { 32 }).min(r.bottom - px(4));
+            let start = px(if roomy { 14 } else { 10 });
             let top = (r.bottom - side) / 2;
             let tile = RECT {
-                left: px(10),
+                left: start,
                 top,
-                right: px(10) + side,
+                right: start + side,
                 bottom: top + side,
             };
             rounded(dc, tile, state.tint(p.selected, p.accent), 7);
@@ -1075,7 +1181,10 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             text(
                 dc,
                 dir.name(),
-                RECT { left: px(51), ..r },
+                RECT {
+                    left: start + side + px(9),
+                    ..r
+                },
                 14,
                 Face::Body,
                 p.text,
@@ -1238,7 +1347,11 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
             text(
                 dc,
                 icon,
-                bounds(10, 0, 33, 38),
+                RECT {
+                    left: px(10),
+                    right: px(33),
+                    ..r
+                },
                 16,
                 Face::Icon,
                 color,
@@ -1248,7 +1361,7 @@ pub unsafe fn item(item: &DRAWITEMSTRUCT) {
                 text(
                     dc,
                     page.title(),
-                    bounds(41, 0, 139, 38),
+                    RECT { left: px(41), ..r },
                     14,
                     if selected { Face::Strong } else { Face::Body },
                     color,

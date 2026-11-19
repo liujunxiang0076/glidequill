@@ -392,7 +392,8 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_COMMAND => {
                 let id = (wp & 0xffff) as i32;
                 if let Some(page) = Page::ALL.into_iter().find(|&p| p as i32 == id) {
-                    if PAGE.with(|v| v.replace(page)) == page {
+                    let previous = PAGE.replace(page);
+                    if previous == page {
                         return 0;
                     }
                     if page == Page::General
@@ -400,7 +401,7 @@ unsafe extern "system" fn proc(w: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     {
                         label(RESULT, &format!("无法读取自启设置：{e}"));
                     }
-                    ui::layout();
+                    ui::switch_page(previous, page);
                     return 0;
                 }
                 match id {
